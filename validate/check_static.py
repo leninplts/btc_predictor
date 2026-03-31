@@ -74,9 +74,12 @@ def _make_temp_db() -> tuple[str, Callable]:
 
 
 def _patch_db_path(tmp_path: str):
-    """Reemplaza storage.DB_PATH con tmp_path."""
+    """Reemplaza el path de SQLite en storage con tmp_path."""
     import data.storage as storage
-    storage.DB_PATH = tmp_path
+    storage.SQLITE_PATH = tmp_path
+    # Forzar SQLite para los tests (incluso si DATABASE_URL esta seteado)
+    storage.USE_POSTGRES = False
+    storage.PH = "?"
 
 
 # ---------------------------------------------------------------------------

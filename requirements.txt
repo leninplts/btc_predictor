@@ -18,5 +18,8 @@ python-dotenv>=1.0.0
 # Utilidades de tiempo
 python-dateutil>=2.8.2
 
+# PostgreSQL
+psycopg2-binary>=2.9.0
+
 # SDK oficial de Polymarket (CLOB)
 py-clob-client>=0.18.0

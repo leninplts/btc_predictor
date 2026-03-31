@@ -1,0 +1,22 @@
+# WebSocket y HTTP async
+aiohttp>=3.9.0
+websockets>=12.0
+
+# HTTP sync (para REST simple)
+requests>=2.31.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Logging estructurado
+loguru>=0.7.0
+
+# Variables de entorno
+python-dotenv>=1.0.0
+
+# Utilidades de tiempo
+python-dateutil>=2.8.2
+
+# SDK oficial de Polymarket (CLOB)
+py-clob-client>=0.18.0

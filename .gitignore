@@ -1,0 +1,177 @@
+# ============================================================
+# SECRETOS Y CREDENCIALES
+# ============================================================
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# ============================================================
+# BASE DE DATOS (datos acumulados, no van al repo)
+# ============================================================
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
+
+# ============================================================
+# LOGS
+# ============================================================
+logs/
+*.log
+
+# ============================================================
+# MODELOS ENTRENADOS (archivos grandes)
+# ============================================================
+models/*.pkl
+models/*.joblib
+models/*.model
+models/*.json
+models/*.bin
+models/*.pt
+models/*.pth
+models/*.onnx
+models/checkpoints/
+models/runs/
+
+# ============================================================
+# PYTHON
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Distribuciones / empaquetado
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+*.whl
+MANIFEST
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+.env/
+.venv/
+virtualenv/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+.hypothesis/
+pytestdebug.log
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# ============================================================
+# IDEs Y EDITORES
+# ============================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+\#*\#
+.\#*
+
+# ============================================================
+# SISTEMA OPERATIVO
+# ============================================================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================
+# DATOS Y OUTPUTS GENERADOS
+# ============================================================
+# Resultados de backtest
+backtest_results/
+results/
+output/
+
+# Graficos generados
+plots/
+figures/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.html
+
+# CSVs de datos (pueden ser grandes)
+data/*.csv
+data/*.parquet
+data/*.feather
+data/*.hdf5
+data/*.h5
+
+# ============================================================
+# TEMPORALES
+# ============================================================
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig

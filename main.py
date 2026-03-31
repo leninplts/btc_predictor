@@ -90,7 +90,8 @@ async def market_discovery_loop(state: BotState) -> None:
                         slug=market.get("slug", ""),
                         description=market.get("description", "")
                     )
-                    state.update_market(market_id, yes_id, no_id)
+                    state.update_market(market_id, yes_id, no_id,
+                                        slug=market.get("slug", ""))
                     logger.success(
                         f"Mercado activo: {market.get('question', '')} "
                         f"| slug={market.get('slug', '')}"
@@ -110,13 +111,123 @@ async def market_discovery_loop(state: BotState) -> None:
                             question=m.get("question", ""),
                             slug=m.get("slug", "")
                         )
-                        state.update_market(m["market_id"], m["asset_id_yes"], m["asset_id_no"])
+                        state.update_market(m["market_id"], m["asset_id_yes"],
+                                            m["asset_id_no"], slug=m.get("slug", ""))
                         break
 
         except Exception as e:
             logger.error(f"Error en discovery loop: {e}")
 
         await asyncio.sleep(MARKET_CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Tarea: poller de mercados resueltos (ground truth)
+# ---------------------------------------------------------------------------
+
+RESOLVED_POLL_INTERVAL = 60   # segundos entre polls (cada minuto)
+
+async def resolved_markets_poller(state: BotState) -> None:
+    """
+    Cada minuto consulta la Gamma API para detectar mercados BTC 5-min
+    que se hayan cerrado recientemente, y los persiste en resolved_markets.
+
+    El WebSocket market_resolved llega ~2 min despues del cierre y ademas
+    nos desuscribimos del mercado viejo al cambiar de intervalo, asi que
+    NUNCA lo capturamos en tiempo real. Este poller es el mecanismo confiable.
+
+    Para cada mercado resuelto:
+      - winning_outcome: "Yes" (UP) o "No" (DOWN)
+      - btc_price_open : precio BTC al inicio del intervalo (de DB o state)
+      - btc_price_close: precio BTC al final del intervalo (de DB o state)
+      - direction      : UP o DOWN (calculado automaticamente)
+    """
+    logger.info("Poller de mercados resueltos iniciado")
+
+    # Esperar 30s para que los WS conecten y tengamos precios BTC
+    await asyncio.sleep(30)
+
+    # Set de market_ids ya procesados (para no reintentar cada ciclo)
+    already_resolved: set[str] = set()
+
+    # Pre-cargar los que ya estan en la DB
+    conn = storage.get_connection()
+    try:
+        rows = conn.execute("SELECT market_id FROM resolved_markets").fetchall()
+        already_resolved = {row["market_id"] for row in rows}
+        if already_resolved:
+            logger.info(f"Poller: {len(already_resolved)} mercados ya resueltos en DB")
+    finally:
+        conn.close()
+
+    while state.running:
+        try:
+            resolved_list = rest.get_recent_resolved_btc_5m_markets(lookback_intervals=12)
+            new_count = 0
+
+            for r in resolved_list:
+                market_id = r["market_id"]
+
+                # Saltar si ya lo procesamos
+                if market_id in already_resolved:
+                    continue
+
+                ts_interval = r.get("ts_interval_start", 0)
+                ts_open_ms  = ts_interval * 1000
+                ts_close_ms = (ts_interval + 300) * 1000
+
+                # Precio BTC al inicio: primero memoria, luego DB
+                btc_open = state.get_open_price(market_id)
+                if btc_open is None:
+                    btc_open = storage.get_btc_price_at(ts_open_ms, source="chainlink")
+                if btc_open is None:
+                    btc_open = storage.get_btc_price_at(ts_open_ms, source="binance")
+
+                # Precio BTC al cierre: primero DB (mas preciso), luego state
+                btc_close = storage.get_btc_price_at(ts_close_ms, source="chainlink")
+                if btc_close is None:
+                    btc_close = storage.get_btc_price_at(ts_close_ms, source="binance")
+                if btc_close is None:
+                    btc_close = (state.last_btc_price_chainlink
+                                 or state.last_btc_price_binance)
+
+                storage.insert_resolved_market(
+                    market_id=market_id,
+                    asset_id_yes=r["asset_id_yes"],
+                    asset_id_no=r["asset_id_no"],
+                    winning_outcome=r["winning_outcome"],
+                    winning_asset=r.get("winning_asset_id", ""),
+                    question=r.get("question", ""),
+                    slug=r.get("slug", ""),
+                    btc_price_open=btc_open,
+                    btc_price_close=btc_close,
+                    ts_open=ts_open_ms if btc_open else None,
+                    ts_resolved=ts_close_ms
+                )
+
+                already_resolved.add(market_id)
+                new_count += 1
+
+                # Calcular direccion para el log
+                if btc_open and btc_close:
+                    direction = "UP" if btc_close > btc_open else "DOWN"
+                    logger.success(
+                        f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                        f"| BTC ${btc_open:,.2f} -> ${btc_close:,.2f} ({direction})"
+                    )
+                else:
+                    logger.success(
+                        f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                        f"| BTC precios no disponibles en DB"
+                    )
+
+            if new_count > 0:
+                logger.info(f"Poller: {new_count} nuevos mercados resueltos registrados")
+
+        except Exception as e:
+            logger.error(f"Error en resolved poller: {e}", exc_info=True)
+
+        await asyncio.sleep(RESOLVED_POLL_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +310,8 @@ async def main() -> None:
         state.update_market(
             market["market_id"],
             market["asset_id_yes"],
-            market["asset_id_no"]
+            market["asset_id_no"],
+            slug=market.get("slug", "")
         )
     else:
         logger.warning(
@@ -209,9 +321,10 @@ async def main() -> None:
 
     # 5. Lanzar todas las tareas en paralelo
     tasks = [
-        asyncio.create_task(run_pipeline(state),       name="websockets"),
-        asyncio.create_task(market_discovery_loop(state), name="discovery"),
-        asyncio.create_task(stats_loop(state),         name="stats"),
+        asyncio.create_task(run_pipeline(state),              name="websockets"),
+        asyncio.create_task(market_discovery_loop(state),     name="discovery"),
+        asyncio.create_task(resolved_markets_poller(state),   name="resolved_poller"),
+        asyncio.create_task(stats_loop(state),                name="stats"),
     ]
 
     logger.success("Pipeline corriendo. Ctrl+C para detener.")

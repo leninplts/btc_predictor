@@ -57,15 +57,38 @@ class BotState:
     def __init__(self):
         self.asset_ids: list[str] = []          # [yes_token_id, no_token_id]
         self.active_market_id: Optional[str] = None
+        self.active_market_slug: Optional[str] = None
         self.running: bool = True
         self.last_btc_price_binance: Optional[float] = None
         self.last_btc_price_chainlink: Optional[float] = None
         self.last_btc_ts: Optional[int] = None
+        # Opcion A: precio BTC al inicio de cada mercado (para calcular UP/DOWN)
+        # clave: market_id, valor: (btc_price_open, ts_open)
+        self.market_open_prices: dict[str, tuple[float, int]] = {}
 
-    def update_market(self, market_id: str, yes_id: str, no_id: str) -> None:
-        self.active_market_id = market_id
+    def update_market(self, market_id: str, yes_id: str, no_id: str,
+                      slug: str = "") -> None:
+        # Guardar el precio BTC del momento de apertura del nuevo mercado
+        btc_open = self.last_btc_price_chainlink or self.last_btc_price_binance
+        ts_open  = int(time.time() * 1000)
+        if btc_open and market_id not in self.market_open_prices:
+            self.market_open_prices[market_id] = (btc_open, ts_open)
+            logger.debug(f"BTC open price registrado para {market_id[:16]}: ${btc_open:,.2f}")
+
+        self.active_market_id   = market_id
+        self.active_market_slug = slug
         self.asset_ids = [yes_id, no_id]
         logger.info(f"Estado actualizado — mercado activo: {market_id[:20]}...")
+
+    def get_open_price(self, market_id: str) -> Optional[float]:
+        """Devuelve el precio BTC de apertura para un market_id dado."""
+        entry = self.market_open_prices.get(market_id)
+        return entry[0] if entry else None
+
+    def get_open_ts(self, market_id: str) -> Optional[int]:
+        """Devuelve el ts de apertura para un market_id dado."""
+        entry = self.market_open_prices.get(market_id)
+        return entry[1] if entry else None
 
     def stop(self) -> None:
         self.running = False
@@ -502,7 +525,7 @@ def _handle_new_market(msg: dict, state: BotState) -> None:
             slug=slug,
             description=desc
         )
-        state.update_market(market_id, yes_id, no_id)
+        state.update_market(market_id, yes_id, no_id, slug=slug)
         logger.success(f"NUEVO MERCADO detectado via WS: {slug}")
     else:
         logger.debug(f"new_market ignorado (no es BTC 5-min): {slug}")

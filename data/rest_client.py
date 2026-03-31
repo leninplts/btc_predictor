@@ -200,6 +200,77 @@ def get_recent_btc_5m_markets(limit: int = 100) -> list[dict]:
     return results
 
 
+def check_market_resolution(slug: str) -> Optional[dict]:
+    """
+    Consulta la Gamma API para ver si un mercado ya fue resuelto.
+
+    La API devuelve:
+      - closed: true/false
+      - outcomes: ["Up", "Down"]    (string JSON)
+      - outcomePrices: ["1", "0"]   (string JSON — "1" = ganador, "0" = perdedor)
+
+    Devuelve dict con el resultado si cerrado, None si aun abierto.
+    """
+    data = _get(f"{GAMMA_BASE}/events", params={"slug": slug})
+    if not data:
+        return None
+
+    events = data if isinstance(data, list) else [data]
+    for event in events:
+        if not event.get("slug"):
+            continue
+        markets_in_event = event.get("markets", [])
+        for m in markets_in_event:
+            if not m.get("closed", False):
+                return None   # aun no cerrado
+
+            # Parsear outcomes y outcomePrices
+            outcomes_raw = m.get("outcomes", [])
+            prices_raw   = m.get("outcomePrices", [])
+
+            if isinstance(outcomes_raw, str):
+                try:
+                    outcomes_raw = json.loads(outcomes_raw)
+                except (json.JSONDecodeError, ValueError):
+                    outcomes_raw = []
+
+            if isinstance(prices_raw, str):
+                try:
+                    prices_raw = json.loads(prices_raw)
+                except (json.JSONDecodeError, ValueError):
+                    prices_raw = []
+
+            # Determinar ganador: el outcome cuyo precio es "1"
+            winning_outcome = None
+            if (isinstance(outcomes_raw, list) and isinstance(prices_raw, list)
+                    and len(outcomes_raw) == len(prices_raw)):
+                for outcome, price in zip(outcomes_raw, prices_raw):
+                    if str(price) == "1":
+                        winning_outcome = outcome
+                        break
+
+            if winning_outcome is None:
+                logger.warning(f"Mercado cerrado pero sin ganador claro: {slug} "
+                               f"outcomes={outcomes_raw} prices={prices_raw}")
+                return None
+
+            token_ids = _parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+
+            return {
+                "market_id":       m.get("conditionId") or m.get("condition_id", ""),
+                "slug":            m.get("slug", slug),
+                "question":        m.get("question", ""),
+                "closed":          True,
+                "winning_outcome": winning_outcome,
+                "outcomes":        outcomes_raw,
+                "outcome_prices":  prices_raw,
+                "asset_id_yes":    token_ids[0] if len(token_ids) > 0 else "",
+                "asset_id_no":     token_ids[1] if len(token_ids) > 1 else "",
+            }
+
+    return None
+
+
 def search_btc_markets(keyword: str = "Bitcoin Up or Down") -> list[dict]:
     """
     Busqueda por texto en la API de Gamma.
@@ -317,6 +388,117 @@ def get_market_by_condition_id(condition_id: str) -> Optional[dict]:
     """Obtiene la informacion completa de un mercado por su condition_id."""
     data = _get(f"{GAMMA_BASE}/markets/{condition_id}")
     return data if data else None
+
+
+# ---------------------------------------------------------------------------
+# Poller de mercados resueltos (fuente de ground truth)
+# ---------------------------------------------------------------------------
+
+def _parse_winning_outcome(outcome_prices_raw) -> Optional[str]:
+    """
+    Parsea outcomePrices para determinar el resultado.
+    outcomePrices viene como string JSON: '["1", "0"]' o '["0", "1"]'
+      - ["1", "0"] -> YES gano (index 0 = precio 1.0)
+      - ["0", "1"] -> NO gano  (index 1 = precio 1.0)
+    Devuelve "Yes", "No" o None si no se puede determinar.
+    """
+    if not outcome_prices_raw:
+        return None
+    try:
+        prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+        if not isinstance(prices, list) or len(prices) < 2:
+            return None
+        p0 = float(prices[0])
+        p1 = float(prices[1])
+        if p0 == 1.0 and p1 == 0.0:
+            return "Yes"
+        if p0 == 0.0 and p1 == 1.0:
+            return "No"
+        return None   # mercado aun no resuelto (precios intermedios)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def get_btc_5m_market_result(slug: str) -> Optional[dict]:
+    """
+    Consulta la Gamma API para obtener el resultado de un mercado BTC 5-min
+    especifico por su slug.
+
+    Devuelve dict con:
+      {
+        market_id, asset_id_yes, asset_id_no,
+        question, slug,
+        winning_outcome: "Yes" | "No",
+        winning_asset_id: str,
+        closed: bool
+      }
+    o None si el mercado no existe o aun no esta resuelto.
+    """
+    data = _get(f"{GAMMA_BASE}/events", params={"slug": slug})
+    if not data:
+        return None
+
+    events = data if isinstance(data, list) else [data]
+    for event in events:
+        if not event.get("slug"):
+            continue
+        for m in event.get("markets", []):
+            if not m.get("closed", False):
+                return None   # aun abierto
+
+            outcome_prices = m.get("outcomePrices")
+            winning_outcome = _parse_winning_outcome(outcome_prices)
+            if not winning_outcome:
+                return None   # sin resultado claro todavia
+
+            token_ids = _parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+            if len(token_ids) < 2:
+                return None
+
+            yes_id = token_ids[0]
+            no_id  = token_ids[1]
+            winning_asset = yes_id if winning_outcome == "Yes" else no_id
+
+            return {
+                "market_id":       m.get("conditionId") or m.get("condition_id", ""),
+                "asset_id_yes":    yes_id,
+                "asset_id_no":     no_id,
+                "question":        m.get("question", ""),
+                "slug":            m.get("slug", slug),
+                "winning_outcome": winning_outcome,
+                "winning_asset_id": winning_asset,
+                "closed":          True,
+            }
+    return None
+
+
+def get_recent_resolved_btc_5m_markets(lookback_intervals: int = 6) -> list[dict]:
+    """
+    Consulta los ultimos N intervalos de 5-min y devuelve los que ya estan resueltos.
+
+    lookback_intervals: cuantos intervalos pasados revisar (default 6 = ultimos 30 min)
+
+    Util para el poller periodico en main.py: detecta resoluciones aunque
+    el bot haya estado caido brevemente.
+
+    Devuelve lista de dicts con el mismo formato que get_btc_5m_market_result().
+    """
+    now_ts  = int(time.time())
+    rounded = (now_ts // 300) * 300
+    resolved = []
+
+    for i in range(1, lookback_intervals + 1):
+        ts_candidate = rounded - (i * 300)
+        slug = f"{BTC_5M_SLUG_KEYWORD}-{ts_candidate}"
+        result = get_btc_5m_market_result(slug)
+        if result:
+            result["ts_interval_start"] = ts_candidate
+            resolved.append(result)
+
+    if resolved:
+        logger.debug(f"Poller: {len(resolved)} mercados resueltos en los ultimos "
+                     f"{lookback_intervals} intervalos")
+    return resolved
 
 
 # ---------------------------------------------------------------------------

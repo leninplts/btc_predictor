@@ -343,6 +343,53 @@ def get_active_markets() -> list[dict]:
         conn.close()
 
 
+def get_unresolved_markets() -> list[dict]:
+    """
+    Devuelve mercados en active_markets con status='active'
+    cuyo intervalo de 5-min ya deberia haber terminado.
+    El slug tiene el formato btc-updown-5m-<unix_ts>, y el mercado
+    cierra 300 segundos despues de ese timestamp.
+    """
+    conn = get_connection()
+    try:
+        now_ms = _now_ms()
+        rows = conn.execute(
+            "SELECT * FROM active_markets WHERE status='active'"
+        ).fetchall()
+        results = []
+        for r in rows:
+            slug = r["slug"] or ""
+            parts = slug.split("-")
+            if len(parts) >= 4 and parts[-1].isdigit():
+                ts_start = int(parts[-1])
+                ts_end_ms = (ts_start + 300) * 1000
+                # Solo incluir mercados cuyo intervalo termino hace >60s
+                if now_ms > ts_end_ms + 60_000:
+                    results.append(dict(r))
+        return results
+    finally:
+        conn.close()
+
+
+def get_btc_price_at(ts_ms: int, source: str = "chainlink", tolerance_ms: int = 30_000) -> Optional[float]:
+    """
+    Devuelve el precio BTC mas cercano al timestamp dado.
+    Busca en un rango de +-tolerance_ms milisegundos.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT price FROM btc_prices
+               WHERE source=? AND ts BETWEEN ? AND ?
+               ORDER BY ABS(ts - ?) ASC
+               LIMIT 1""",
+            (source, ts_ms - tolerance_ms, ts_ms + tolerance_ms, ts_ms)
+        ).fetchone()
+        return row["price"] if row else None
+    finally:
+        conn.close()
+
+
 def get_db_stats() -> dict:
     """Estadisticas rapidas de cuantos registros hay en cada tabla."""
     conn = get_connection()

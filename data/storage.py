@@ -205,8 +205,14 @@ def init_db() -> None:
     for table, cols in _migrations:
         for col in cols:
             try:
+                if USE_POSTGRES:
+                    cur.execute("SAVEPOINT migration_sp")
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                if USE_POSTGRES:
+                    cur.execute("RELEASE SAVEPOINT migration_sp")
             except Exception:
+                if USE_POSTGRES:
+                    cur.execute("ROLLBACK TO SAVEPOINT migration_sp")
                 pass  # columna ya existe
 
     cur.execute(f"""

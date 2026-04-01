@@ -21,7 +21,9 @@ import asyncio
 import signal
 import sys
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+_TZ_LIMA = timezone(timedelta(hours=-5))
 
 from loguru import logger
 
@@ -176,6 +178,12 @@ async def resolved_markets_poller(state: BotState) -> None:
                 ts_open_ms  = ts_interval * 1000
                 ts_close_ms = (ts_interval + 300) * 1000
 
+                # Formato legible del intervalo (hora Lima UTC-5)
+                dt_open  = datetime.fromtimestamp(ts_interval, tz=_TZ_LIMA)
+                dt_close = datetime.fromtimestamp(ts_interval + 300, tz=_TZ_LIMA)
+                intervalo_str = (f"{dt_open.strftime('%Y-%m-%d %H:%M')} -> "
+                                 f"{dt_close.strftime('%H:%M')} Lima")
+
                 # Precio BTC al inicio: primero memoria, luego DB
                 btc_open = state.get_open_price(market_id)
                 if btc_open is None:
@@ -212,12 +220,12 @@ async def resolved_markets_poller(state: BotState) -> None:
                 if btc_open and btc_close:
                     direction = "UP" if btc_close > btc_open else "DOWN"
                     logger.success(
-                        f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                        f"RESUELTO [{r['winning_outcome']}] {intervalo_str} "
                         f"| BTC ${btc_open:,.2f} -> ${btc_close:,.2f} ({direction})"
                     )
                 else:
                     logger.success(
-                        f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                        f"RESUELTO [{r['winning_outcome']}] {intervalo_str} "
                         f"| BTC precios no disponibles en DB"
                     )
 
@@ -251,7 +259,7 @@ async def stats_loop(state: BotState) -> None:
                             if state.last_btc_price_chainlink else "N/A"
 
             logger.info(
-                f"--- STATS [{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] ---\n"
+                f"--- STATS [{datetime.now(_TZ_LIMA).strftime('%H:%M:%S Lima')}] ---\n"
                 f"  BTC Binance   : {price_str}\n"
                 f"  BTC Chainlink : {chainlink_str}\n"
                 f"  btc_prices    : {stats.get('btc_prices', 0):,} registros\n"

@@ -20,7 +20,7 @@ Tablas:
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from loguru import logger
 
@@ -112,7 +112,8 @@ def init_db() -> None:
             ts_recv     BIGINT NOT NULL,
             source      TEXT   NOT NULL,
             symbol      TEXT   NOT NULL,
-            price       DOUBLE PRECISION NOT NULL
+            price       DOUBLE PRECISION NOT NULL,
+            dt          TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_btc_prices_ts ON btc_prices(ts)")
@@ -127,7 +128,8 @@ def init_db() -> None:
             market_id   TEXT   NOT NULL,
             bids        TEXT   NOT NULL,
             asks        TEXT   NOT NULL,
-            hash        TEXT
+            hash        TEXT,
+            dt          TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ob_ts ON orderbook_snapshots(ts)")
@@ -145,7 +147,8 @@ def init_db() -> None:
             side        TEXT   NOT NULL,
             best_bid    DOUBLE PRECISION,
             best_ask    DOUBLE PRECISION,
-            hash        TEXT
+            hash        TEXT,
+            dt          TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pc_ts ON price_changes(ts)")
@@ -161,7 +164,8 @@ def init_db() -> None:
             price       DOUBLE PRECISION NOT NULL,
             size        DOUBLE PRECISION NOT NULL,
             side        TEXT   NOT NULL,
-            fee_rate_bps TEXT
+            fee_rate_bps TEXT,
+            dt          TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lt_ts ON last_trades(ts)")
@@ -182,10 +186,28 @@ def init_db() -> None:
             direction       TEXT,
             ts_open         BIGINT,
             ts_resolved     BIGINT NOT NULL,
-            ts_recv         BIGINT NOT NULL
+            ts_recv         BIGINT NOT NULL,
+            dt_open         TEXT,
+            dt_resolved     TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_rm_ts ON resolved_markets(ts_resolved)")
+
+    # Migracion: agregar columnas dt_* legibles si las tablas ya existian
+    _migrations = [
+        ("btc_prices",          ["dt"]),
+        ("orderbook_snapshots", ["dt"]),
+        ("price_changes",       ["dt"]),
+        ("last_trades",         ["dt"]),
+        ("resolved_markets",    ["dt_open", "dt_resolved"]),
+        ("active_markets",      ["dt_discovered", "dt_updated"]),
+    ]
+    for table, cols in _migrations:
+        for col in cols:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            except Exception:
+                pass  # columna ya existe
 
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS active_markets (
@@ -198,7 +220,9 @@ def init_db() -> None:
             description     TEXT,
             status          TEXT DEFAULT 'active',
             ts_discovered   BIGINT NOT NULL,
-            ts_updated      BIGINT NOT NULL
+            ts_updated      BIGINT NOT NULL,
+            dt_discovered   TEXT,
+            dt_updated      TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_am_status ON active_markets(status)")
@@ -234,9 +258,9 @@ def insert_btc_price(source: str, symbol: str, price: float, ts: int) -> None:
     conn = get_connection()
     try:
         conn.cursor().execute(
-            f"INSERT INTO btc_prices (ts, ts_recv, source, symbol, price) "
-            f"VALUES ({PH},{PH},{PH},{PH},{PH})",
-            (ts, _now_ms(), source, symbol, price)
+            f"INSERT INTO btc_prices (ts, ts_recv, source, symbol, price, dt) "
+            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH})",
+            (ts, _now_ms(), source, symbol, price, _ms_to_lima_str(ts))
         )
         conn.commit()
     finally:
@@ -256,10 +280,10 @@ def insert_orderbook_snapshot(
     try:
         conn.cursor().execute(
             f"INSERT INTO orderbook_snapshots "
-            f"(ts, ts_recv, asset_id, market_id, bids, asks, hash) "
-            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH})",
+            f"(ts, ts_recv, asset_id, market_id, bids, asks, hash, dt) "
+            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
             (ts, _now_ms(), asset_id, market_id,
-             json.dumps(bids), json.dumps(asks), hash_val)
+             json.dumps(bids), json.dumps(asks), hash_val, _ms_to_lima_str(ts))
         )
         conn.commit()
     finally:
@@ -282,10 +306,10 @@ def insert_price_change(
     try:
         conn.cursor().execute(
             f"INSERT INTO price_changes "
-            f"(ts, ts_recv, asset_id, market_id, price, size, side, best_bid, best_ask, hash) "
-            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
+            f"(ts, ts_recv, asset_id, market_id, price, size, side, best_bid, best_ask, hash, dt) "
+            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
             (ts, _now_ms(), asset_id, market_id,
-             price, size, side, best_bid, best_ask, hash_val)
+             price, size, side, best_bid, best_ask, hash_val, _ms_to_lima_str(ts))
         )
         conn.commit()
     finally:
@@ -306,10 +330,10 @@ def insert_last_trade(
     try:
         conn.cursor().execute(
             f"INSERT INTO last_trades "
-            f"(ts, ts_recv, asset_id, market_id, price, size, side, fee_rate_bps) "
-            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
+            f"(ts, ts_recv, asset_id, market_id, price, size, side, fee_rate_bps, dt) "
+            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
             (ts, _now_ms(), asset_id, market_id,
-             price, size, side, fee_rate_bps)
+             price, size, side, fee_rate_bps, _ms_to_lima_str(ts))
         )
         conn.commit()
     finally:
@@ -327,24 +351,36 @@ def upsert_active_market(
     """Registra o actualiza un mercado activo."""
     conn = get_connection()
     now = _now_ms()
+    dt_now = _ms_to_lima_str(now)
     try:
         conn.cursor().execute(
             f"INSERT INTO active_markets "
             f"(market_id, asset_id_yes, asset_id_no, question, slug, description, "
-            f" status, ts_discovered, ts_updated) "
-            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},'active',{PH},{PH}) "
+            f" status, ts_discovered, ts_updated, dt_discovered, dt_updated) "
+            f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},'active',{PH},{PH},{PH},{PH}) "
             f"ON CONFLICT(market_id) DO UPDATE SET "
             f"  question=EXCLUDED.question, "
             f"  slug=EXCLUDED.slug, "
             f"  description=EXCLUDED.description, "
             f"  status='active', "
-            f"  ts_updated=EXCLUDED.ts_updated",
+            f"  ts_updated=EXCLUDED.ts_updated, "
+            f"  dt_updated=EXCLUDED.dt_updated",
             (market_id, asset_id_yes, asset_id_no,
-             question, slug, description, now, now)
+             question, slug, description, now, now, dt_now, dt_now)
         )
         conn.commit()
     finally:
         conn.close()
+
+
+_TZ_LIMA = timezone(timedelta(hours=-5))
+
+
+def _ms_to_lima_str(ts_ms: Optional[int]) -> Optional[str]:
+    """Convierte timestamp en milisegundos a string legible 'YYYY-MM-DD HH:MM:SS' en hora Lima (UTC-5)."""
+    if ts_ms is None:
+        return None
+    return datetime.fromtimestamp(ts_ms / 1000, tz=_TZ_LIMA).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def insert_resolved_market(
@@ -367,6 +403,12 @@ def insert_resolved_market(
 
     conn = get_connection()
     now = _now_ms()
+    ts_resolved_final = ts_resolved or now
+
+    # Columnas legibles para consulta visual (hora Lima UTC-5)
+    dt_open     = _ms_to_lima_str(ts_open)
+    dt_resolved = _ms_to_lima_str(ts_resolved_final)
+
     try:
         cur = conn.cursor()
         # INSERT con ON CONFLICT DO NOTHING (compatible PG y SQLite)
@@ -375,23 +417,23 @@ def insert_resolved_market(
                 f"INSERT INTO resolved_markets "
                 f"(market_id, asset_id_yes, asset_id_no, question, slug, "
                 f" winning_outcome, winning_asset, btc_price_open, btc_price_close, "
-                f" direction, ts_open, ts_resolved, ts_recv) "
-                f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH}) "
+                f" direction, ts_open, ts_resolved, ts_recv, dt_open, dt_resolved) "
+                f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH}) "
                 f"ON CONFLICT (market_id) DO NOTHING",
                 (market_id, asset_id_yes, asset_id_no, question, slug,
                  winning_outcome, winning_asset, btc_price_open, btc_price_close,
-                 direction, ts_open, ts_resolved or now, now)
+                 direction, ts_open, ts_resolved_final, now, dt_open, dt_resolved)
             )
         else:
             cur.execute(
                 f"INSERT OR IGNORE INTO resolved_markets "
                 f"(market_id, asset_id_yes, asset_id_no, question, slug, "
                 f" winning_outcome, winning_asset, btc_price_open, btc_price_close, "
-                f" direction, ts_open, ts_resolved, ts_recv) "
-                f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
+                f" direction, ts_open, ts_resolved, ts_recv, dt_open, dt_resolved) "
+                f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})",
                 (market_id, asset_id_yes, asset_id_no, question, slug,
                  winning_outcome, winning_asset, btc_price_open, btc_price_close,
-                 direction, ts_open, ts_resolved or now, now)
+                 direction, ts_open, ts_resolved_final, now, dt_open, dt_resolved)
             )
 
         # Marcar como resuelto en active_markets

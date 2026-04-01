@@ -1,15 +1,21 @@
 """
 main.py
 -------
-Orquestador principal del pipeline de datos — Fase 1.
+Orquestador principal del bot de trading BTC en Polymarket.
 
-Flujo:
-  1. Inicializa la base de datos SQLite
-  2. Verifica conectividad con las APIs de Polymarket
-  3. Descubre el mercado BTC 5-min activo via REST
-  4. Lanza los workers WebSocket (RTDS + Market Channel) en paralelo
-  5. Cada 5 minutos re-verifica si hay un nuevo mercado BTC 5-min activo
-  6. Cada 60 segundos imprime estadisticas de cuantos registros se han guardado
+Flujo completo:
+  1. Inicializa DB, verifica APIs, conecta Telegram
+  2. Lanza WebSockets (RTDS + Market Channel)
+  3. Cada nuevo mercado BTC 5-min:
+     a. Genera features en tiempo real
+     b. Modelo predice P(up)
+     c. Estrategia decide: BUY_YES, BUY_NO o SKIP
+     d. Paper wallet abre posicion
+     e. Telegram notifica la decision
+  4. Cada mercado resuelto:
+     a. Paper wallet cierra posicion y calcula PnL
+     b. Telegram notifica el resultado
+  5. Estadisticas cada 60 segundos
 
 Uso:
   python main.py
@@ -18,60 +24,91 @@ Para detener: Ctrl+C
 """
 
 import asyncio
+import json
 import signal
 import sys
 import os
+import time
 from datetime import datetime, timezone, timedelta
 
-_TZ_LIMA = timezone(timedelta(hours=-5))
-
+import pandas as pd
 from loguru import logger
 
 from data import storage
 from data import rest_client as rest
 from data.websocket_client import BotState, run_pipeline
+from strategy.engine import StrategyEngine
+from execution.paper_wallet import PaperWallet
+from execution.telegram_bot import (
+    TelegramNotifier, set_refs, start_telegram_polling
+)
 
 
 # ---------------------------------------------------------------------------
-# Configuracion de logging
+# Configuracion
+# ---------------------------------------------------------------------------
+
+_TZ_LIMA = timezone(timedelta(hours=-5))
+
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8619893862:AAFeqiKfE__P-3Eu9Sfw8cz-Ys5WgF8cwKU")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1435277461")
+
+INITIAL_CAPITAL     = float(os.environ.get("BOT_INITIAL_CAPITAL", "1000"))
+MIN_CONFIDENCE      = float(os.environ.get("BOT_MIN_CONFIDENCE", "0.55"))
+MAX_RISK_PER_TRADE  = float(os.environ.get("BOT_MAX_RISK", "0.05"))
+KELLY_FRACTION      = float(os.environ.get("BOT_KELLY_FRACTION", "0.35"))
+
+MARKET_CHECK_INTERVAL  = 60
+RESOLVED_POLL_INTERVAL = 60
+STATS_INTERVAL         = 60
+
+
+# ---------------------------------------------------------------------------
+# Logging
 # ---------------------------------------------------------------------------
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-logger.remove()  # quitar handler default
-
-# Consola: nivel INFO, formato limpio
+logger.remove()
 logger.add(
-    sys.stdout,
-    level="INFO",
+    sys.stdout, level="INFO",
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
     colorize=True
 )
-
-# Archivo: nivel DEBUG, rotacion diaria
 logger.add(
-    os.path.join(LOG_DIR, "pipeline_{time:YYYY-MM-DD}.log"),
-    level="DEBUG",
-    rotation="00:00",      # nuevo archivo cada dia
-    retention="14 days",   # conservar 2 semanas
+    os.path.join(LOG_DIR, "bot_{time:YYYY-MM-DD}.log"),
+    level="DEBUG", rotation="00:00", retention="14 days",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}"
 )
 
 
 # ---------------------------------------------------------------------------
-# Tarea: discovery periodico del mercado activo
+# Componentes globales (se inicializan en main())
 # ---------------------------------------------------------------------------
 
-MARKET_CHECK_INTERVAL = 60   # segundos entre checks de mercado activo
+notifier: TelegramNotifier = None
+wallet: PaperWallet = None
+engine: StrategyEngine = None
+_last_decision_market: str = ""  # para no decidir dos veces el mismo mercado
 
-async def market_discovery_loop(state: BotState) -> None:
+
+# ---------------------------------------------------------------------------
+# Tarea: discovery + decision de trading
+# ---------------------------------------------------------------------------
+
+async def market_discovery_and_trade_loop(state: BotState) -> None:
     """
-    Cada MARKET_CHECK_INTERVAL segundos consulta la REST API para ver si
-    hay un mercado BTC 5-min activo y actualiza el estado del bot.
-    Esto cubre el caso donde el WebSocket new_market no se recibe a tiempo.
+    Cada 60s busca si hay un nuevo mercado BTC 5-min.
+    Cuando detecta uno nuevo:
+      1. Actualiza el estado
+      2. Ejecuta el ciclo de decision del strategy engine
+      3. Si la decision es operar, abre posicion en paper wallet
+      4. Notifica por Telegram
     """
-    logger.info("Discovery loop iniciado")
+    global _last_decision_market
+
+    logger.info("Discovery + Trade loop iniciado")
 
     while state.running:
         try:
@@ -81,97 +118,153 @@ async def market_discovery_loop(state: BotState) -> None:
                 market_id = market["market_id"]
                 yes_id    = market["asset_id_yes"]
                 no_id     = market["asset_id_no"]
+                slug      = market.get("slug", "")
+                question  = market.get("question", "")
 
-                # Solo actualizar si es un mercado distinto al actual
                 if market_id != state.active_market_id:
+                    # Nuevo mercado detectado
                     storage.upsert_active_market(
                         market_id=market_id,
                         asset_id_yes=yes_id,
                         asset_id_no=no_id,
-                        question=market.get("question", ""),
-                        slug=market.get("slug", ""),
+                        question=question,
+                        slug=slug,
                         description=market.get("description", "")
                     )
-                    state.update_market(market_id, yes_id, no_id,
-                                        slug=market.get("slug", ""))
-                    logger.success(
-                        f"Mercado activo: {market.get('question', '')} "
-                        f"| slug={market.get('slug', '')}"
-                    )
-                else:
-                    logger.debug(f"Mercado sin cambios: {market.get('slug', '')}")
-            else:
-                # Fallback: buscar por texto
-                logger.debug("Intentando busqueda por texto...")
-                markets = rest.search_btc_markets("Bitcoin Up or Down")
-                for m in markets:
-                    if m.get("active") and m["market_id"] != state.active_market_id:
-                        storage.upsert_active_market(
-                            market_id=m["market_id"],
-                            asset_id_yes=m["asset_id_yes"],
-                            asset_id_no=m["asset_id_no"],
-                            question=m.get("question", ""),
-                            slug=m.get("slug", "")
-                        )
-                        state.update_market(m["market_id"], m["asset_id_yes"],
-                                            m["asset_id_no"], slug=m.get("slug", ""))
-                        break
+                    state.update_market(market_id, yes_id, no_id, slug=slug)
+                    logger.success(f"Nuevo mercado: {question} | {slug}")
+
+                    # --- Ciclo de decision ---
+                    if market_id != _last_decision_market and engine is not None:
+                        _last_decision_market = market_id
+                        await _run_trading_decision(state, market)
 
         except Exception as e:
-            logger.error(f"Error en discovery loop: {e}")
+            logger.error(f"Error en discovery/trade loop: {e}", exc_info=True)
+            if notifier:
+                await notifier.notify_error(f"Discovery loop: {e}")
 
         await asyncio.sleep(MARKET_CHECK_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# Tarea: poller de mercados resueltos (ground truth)
-# ---------------------------------------------------------------------------
+async def _run_trading_decision(state: BotState, market: dict) -> None:
+    """Ejecuta el ciclo completo de decision para un mercado nuevo."""
+    market_id = market["market_id"]
+    slug      = market.get("slug", "")
+    yes_id    = market["asset_id_yes"]
+    no_id     = market["asset_id_no"]
+    question  = market.get("question", "")
 
-RESOLVED_POLL_INTERVAL = 60   # segundos entre polls (cada minuto)
+    # Notificar nuevo mercado
+    if notifier:
+        await notifier.notify_new_market(slug, question)
+
+    # Obtener datos para features
+    conn = storage.get_connection()
+    try:
+        # Ticks BTC recientes (ultima hora)
+        cutoff_ms = int(time.time() * 1000) - 3600_000
+        btc_rows = storage._fetchall(
+            conn.cursor(),
+            f"SELECT ts, price FROM btc_prices WHERE source='chainlink' AND ts > {storage.PH} ORDER BY ts ASC",
+            (cutoff_ms,)
+        )
+        btc_ticks = pd.DataFrame(btc_rows) if btc_rows else None
+
+        # Ultimo snapshot del order book
+        snap_row = storage._fetchone(
+            conn.cursor(),
+            "SELECT bids, asks FROM orderbook_snapshots ORDER BY ts DESC LIMIT 1"
+        )
+        bids = json.loads(snap_row["bids"]) if snap_row else []
+        asks = json.loads(snap_row["asks"]) if snap_row else []
+
+        # Trades recientes
+        trade_rows = storage._fetchall(
+            conn.cursor(),
+            "SELECT ts, price, size, side FROM last_trades ORDER BY ts DESC LIMIT 100"
+        )
+        trades_df = pd.DataFrame(trade_rows) if trade_rows else None
+
+        # Outcomes recientes
+        outcome_rows = storage._fetchall(
+            conn.cursor(),
+            "SELECT winning_outcome FROM resolved_markets ORDER BY ts_resolved DESC LIMIT 15"
+        )
+        recent_outcomes = [r["winning_outcome"] for r in outcome_rows][::-1]
+
+        # Share price: usar ob_midpoint del ultimo snapshot
+        if bids and asks:
+            best_bid = float(bids[0].get("price", 0.5)) if bids else 0.5
+            best_ask = float(asks[0].get("price", 0.5)) if asks else 0.5
+            share_price = (best_bid + best_ask) / 2
+        else:
+            share_price = 0.5
+
+    finally:
+        conn.close()
+
+    # Ejecutar decision
+    decision = engine.decide(
+        market_id=market_id,
+        slug=slug,
+        asset_id_yes=yes_id,
+        asset_id_no=no_id,
+        btc_ticks=btc_ticks,
+        latest_snapshot_bids=bids,
+        latest_snapshot_asks=asks,
+        recent_trades=trades_df,
+        share_price_yes=share_price,
+        share_price_yes_prev=None,
+        recent_outcomes=recent_outcomes,
+    )
+
+    # Notificar decision por Telegram
+    if notifier:
+        await notifier.notify_decision(decision.to_dict())
+
+    # Si decide operar, abrir posicion en paper wallet
+    if decision.action != "SKIP" and decision.usdc_amount > 0:
+        wallet.open_position(
+            market_id=market_id,
+            slug=slug,
+            action=decision.action,
+            token_id=decision.token_id,
+            buy_price=decision.target_price,
+            usdc_amount=decision.usdc_amount,
+            n_shares=decision.n_shares,
+            fee=decision.fee_estimated,
+            prob_up=decision.prob_up,
+            confidence=decision.confidence,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tarea: poller de mercados resueltos + cierre de posiciones
+# ---------------------------------------------------------------------------
 
 async def resolved_markets_poller(state: BotState) -> None:
     """
-    Cada minuto consulta la Gamma API para detectar mercados BTC 5-min
-    que se hayan cerrado recientemente, y los persiste en resolved_markets.
-
-    El WebSocket market_resolved llega ~2 min despues del cierre y ademas
-    nos desuscribimos del mercado viejo al cambiar de intervalo, asi que
-    NUNCA lo capturamos en tiempo real. Este poller es el mecanismo confiable.
-
-    Para cada mercado resuelto:
-      - winning_outcome: "Yes" (UP) o "No" (DOWN)
-      - btc_price_open : precio BTC al inicio del intervalo (de DB o state)
-      - btc_price_close: precio BTC al final del intervalo (de DB o state)
-      - direction      : UP o DOWN (calculado automaticamente)
+    Cada minuto detecta mercados resueltos via REST.
+    Si hay posicion abierta en ese mercado, la cierra y notifica.
     """
-    logger.info("Poller de mercados resueltos iniciado")
-
-    # Esperar 30s para que los WS conecten y tengamos precios BTC
+    logger.info("Resolved poller iniciado")
     await asyncio.sleep(30)
 
-    # Set de market_ids ya procesados (para no reintentar cada ciclo)
     already_resolved: set[str] = set()
-
-    # Pre-cargar los que ya estan en la DB
     conn = storage.get_connection()
     try:
-        cur = conn.cursor()
-        rows = storage._fetchall(cur, "SELECT market_id FROM resolved_markets")
+        rows = storage._fetchall(conn.cursor(), "SELECT market_id FROM resolved_markets")
         already_resolved = {row["market_id"] for row in rows}
-        if already_resolved:
-            logger.info(f"Poller: {len(already_resolved)} mercados ya resueltos en DB")
     finally:
         conn.close()
 
     while state.running:
         try:
             resolved_list = rest.get_recent_resolved_btc_5m_markets(lookback_intervals=12)
-            new_count = 0
 
             for r in resolved_list:
                 market_id = r["market_id"]
-
-                # Saltar si ya lo procesamos
                 if market_id in already_resolved:
                     continue
 
@@ -179,26 +272,17 @@ async def resolved_markets_poller(state: BotState) -> None:
                 ts_open_ms  = ts_interval * 1000
                 ts_close_ms = (ts_interval + 300) * 1000
 
-                # Formato legible del intervalo (hora Lima UTC-5)
-                dt_open  = datetime.fromtimestamp(ts_interval, tz=_TZ_LIMA)
-                dt_close = datetime.fromtimestamp(ts_interval + 300, tz=_TZ_LIMA)
-                intervalo_str = (f"{dt_open.strftime('%Y-%m-%d %H:%M')} -> "
-                                 f"{dt_close.strftime('%H:%M')} Lima")
-
-                # Precio BTC al inicio: primero memoria, luego DB
                 btc_open = state.get_open_price(market_id)
                 if btc_open is None:
                     btc_open = storage.get_btc_price_at(ts_open_ms, source="chainlink")
                 if btc_open is None:
                     btc_open = storage.get_btc_price_at(ts_open_ms, source="binance")
 
-                # Precio BTC al cierre: primero DB (mas preciso), luego state
                 btc_close = storage.get_btc_price_at(ts_close_ms, source="chainlink")
                 if btc_close is None:
                     btc_close = storage.get_btc_price_at(ts_close_ms, source="binance")
                 if btc_close is None:
-                    btc_close = (state.last_btc_price_chainlink
-                                 or state.last_btc_price_binance)
+                    btc_close = state.last_btc_price_chainlink or state.last_btc_price_binance
 
                 storage.insert_resolved_market(
                     market_id=market_id,
@@ -213,25 +297,34 @@ async def resolved_markets_poller(state: BotState) -> None:
                     ts_open=ts_open_ms if btc_open else None,
                     ts_resolved=ts_close_ms
                 )
-
                 already_resolved.add(market_id)
-                new_count += 1
 
-                # Calcular direccion para el log
+                direction = ""
                 if btc_open and btc_close:
                     direction = "UP" if btc_close > btc_open else "DOWN"
-                    logger.success(
-                        f"RESUELTO [{r['winning_outcome']}] {intervalo_str} "
-                        f"| BTC ${btc_open:,.2f} -> ${btc_close:,.2f} ({direction})"
-                    )
-                else:
-                    logger.success(
-                        f"RESUELTO [{r['winning_outcome']}] {intervalo_str} "
-                        f"| BTC precios no disponibles en DB"
-                    )
 
-            if new_count > 0:
-                logger.info(f"Poller: {new_count} nuevos mercados resueltos registrados")
+                logger.success(
+                    f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                    f"| BTC ${btc_open or 0:,.2f} -> ${btc_close or 0:,.2f} ({direction})"
+                )
+
+                # --- Cerrar posicion en paper wallet ---
+                trade = wallet.resolve_position(market_id, r["winning_outcome"])
+                if trade:
+                    engine.update_capital(trade.pnl)
+                    balance = wallet.get_balance()
+                    if notifier:
+                        await notifier.notify_resolution(
+                            {
+                                "slug": trade.slug,
+                                "action": trade.action,
+                                "won": trade.won,
+                                "pnl": trade.pnl,
+                                "pnl_pct": trade.pnl_pct,
+                                "outcome": trade.winning_outcome,
+                            },
+                            balance
+                        )
 
         except Exception as e:
             logger.error(f"Error en resolved poller: {e}", exc_info=True)
@@ -243,32 +336,29 @@ async def resolved_markets_poller(state: BotState) -> None:
 # Tarea: estadisticas periodicas
 # ---------------------------------------------------------------------------
 
-STATS_INTERVAL = 60   # segundos entre impresion de estadisticas
-
 async def stats_loop(state: BotState) -> None:
-    """Cada minuto imprime cuantos registros se han guardado."""
+    """Cada minuto imprime stats de DB + wallet."""
     while state.running:
         await asyncio.sleep(STATS_INTERVAL)
         try:
-            stats = storage.get_db_stats()
-            btc   = storage.get_latest_btc_price("binance")
-            btc_c = storage.get_latest_btc_price("chainlink")
+            db_stats = storage.get_db_stats()
+            balance = wallet.get_balance() if wallet else {}
 
             price_str = f"${state.last_btc_price_binance:,.2f}" \
                         if state.last_btc_price_binance else "N/A"
-            chainlink_str = f"${state.last_btc_price_chainlink:,.2f}" \
-                            if state.last_btc_price_chainlink else "N/A"
 
             logger.info(
                 f"--- STATS [{datetime.now(_TZ_LIMA).strftime('%H:%M:%S Lima')}] ---\n"
-                f"  BTC Binance   : {price_str}\n"
-                f"  BTC Chainlink : {chainlink_str}\n"
-                f"  btc_prices    : {stats.get('btc_prices', 0):,} registros\n"
-                f"  orderbook_snap: {stats.get('orderbook_snapshots', 0):,} registros\n"
-                f"  price_changes : {stats.get('price_changes', 0):,} registros\n"
-                f"  last_trades   : {stats.get('last_trades', 0):,} registros\n"
-                f"  resolved      : {stats.get('resolved_markets', 0):,} mercados\n"
-                f"  active_markets: {stats.get('active_markets', 0):,} mercados"
+                f"  BTC: {price_str}\n"
+                f"  DB: prices={db_stats.get('btc_prices',0):,} | "
+                f"ob={db_stats.get('orderbook_snapshots',0):,} | "
+                f"trades={db_stats.get('last_trades',0):,} | "
+                f"resolved={db_stats.get('resolved_markets',0):,}\n"
+                f"  Wallet: ${balance.get('equity_total', 0):.2f} | "
+                f"PnL: ${balance.get('pnl_total', 0):+.2f} ({balance.get('pnl_total_pct', 0):+.1f}%) | "
+                f"WR: {balance.get('win_rate', 0):.0%} "
+                f"({balance.get('wins', 0)}W/{balance.get('losses', 0)}L) | "
+                f"Open: {balance.get('posiciones_abiertas', 0)}"
             )
         except Exception as e:
             logger.error(f"Error en stats loop: {e}")
@@ -279,32 +369,39 @@ async def stats_loop(state: BotState) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    global notifier, wallet, engine
+
     logger.info("=" * 60)
-    logger.info("  BOT CRIPTO — Pipeline de Datos — Fase 1")
+    logger.info("  BOT CRIPTO — Polymarket BTC 5-min Predictor")
     logger.info("=" * 60)
 
     # 1. Inicializar DB
     storage.init_db()
 
-    # 2. Verificar conectividad
-    logger.info("Verificando conectividad con Polymarket...")
+    # 2. Verificar APIs
+    logger.info("Verificando conectividad...")
     clob_ok  = rest.ping_clob()
     gamma_ok = rest.ping_gamma()
+    logger.info(f"CLOB: {'OK' if clob_ok else 'FAIL'} | Gamma: {'OK' if gamma_ok else 'FAIL'}")
 
-    if not clob_ok:
-        logger.warning("CLOB API no responde — datos de order book pueden fallar")
-    else:
-        logger.success("CLOB API: OK")
+    # 3. Inicializar componentes
+    wallet = PaperWallet(initial_capital=INITIAL_CAPITAL)
+    engine = StrategyEngine(
+        capital=INITIAL_CAPITAL,
+        paper_mode=True,
+        min_confidence=MIN_CONFIDENCE,
+        max_risk_per_trade=MAX_RISK_PER_TRADE,
+        kelly_fraction=KELLY_FRACTION,
+    )
+    notifier = TelegramNotifier(token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID)
 
-    if not gamma_ok:
-        logger.warning("Gamma API no responde — market discovery puede fallar")
-    else:
-        logger.success("Gamma API: OK")
+    # Pasar referencias al modulo de telegram para los comandos
+    set_refs(wallet, engine, notifier)
 
-    # 3. Estado compartido
+    # 4. Estado compartido
     state = BotState()
 
-    # 4. Primer discovery sincrono para no esperar el primer tick del loop
+    # 5. Primer discovery
     logger.info("Buscando mercado BTC 5-min activo...")
     market = rest.get_active_btc_5m_market()
     if market:
@@ -317,26 +414,31 @@ async def main() -> None:
             description=market.get("description", "")
         )
         state.update_market(
-            market["market_id"],
-            market["asset_id_yes"],
-            market["asset_id_no"],
-            slug=market.get("slug", "")
-        )
-    else:
-        logger.warning(
-            "No se encontro mercado BTC 5-min activo ahora mismo.\n"
-            "El pipeline esperara hasta que haya uno disponible."
+            market["market_id"], market["asset_id_yes"],
+            market["asset_id_no"], slug=market.get("slug", "")
         )
 
-    # 5. Lanzar todas las tareas en paralelo
+    # 6. Iniciar Telegram polling (comandos)
+    telegram_app = await start_telegram_polling(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+
+    # 7. Notificar startup
+    if notifier:
+        await notifier.notify_startup({
+            "capital": INITIAL_CAPITAL,
+            "model_loaded": engine.predictor.is_loaded(),
+            "paper_mode": True,
+            "db_backend": "PostgreSQL" if storage.USE_POSTGRES else "SQLite",
+        })
+
+    # 8. Lanzar tareas
     tasks = [
-        asyncio.create_task(run_pipeline(state),              name="websockets"),
-        asyncio.create_task(market_discovery_loop(state),     name="discovery"),
-        asyncio.create_task(resolved_markets_poller(state),   name="resolved_poller"),
-        asyncio.create_task(stats_loop(state),                name="stats"),
+        asyncio.create_task(run_pipeline(state),                    name="websockets"),
+        asyncio.create_task(market_discovery_and_trade_loop(state), name="discovery_trade"),
+        asyncio.create_task(resolved_markets_poller(state),         name="resolved_poller"),
+        asyncio.create_task(stats_loop(state),                      name="stats"),
     ]
 
-    logger.success("Pipeline corriendo. Ctrl+C para detener.")
+    logger.success("Bot corriendo. Ctrl+C para detener.")
 
     try:
         await asyncio.gather(*tasks)
@@ -346,13 +448,15 @@ async def main() -> None:
         state.stop()
         for task in tasks:
             task.cancel()
-        logger.info("Pipeline detenido correctamente")
-        final_stats = storage.get_db_stats()
-        logger.info(f"Registros totales guardados: {final_stats}")
+        if telegram_app:
+            await telegram_app.updater.stop()
+            await telegram_app.stop()
+            await telegram_app.shutdown()
+        logger.info("Bot detenido correctamente")
 
 
 # ---------------------------------------------------------------------------
-# Entry point con manejo de Ctrl+C
+# Entry point
 # ---------------------------------------------------------------------------
 
 def _handle_sigint(loop: asyncio.AbstractEventLoop) -> None:
@@ -365,7 +469,6 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Manejo de Ctrl+C en Windows (no soporta add_signal_handler)
     if sys.platform != "win32":
         loop.add_signal_handler(signal.SIGINT,  lambda: _handle_sigint(loop))
         loop.add_signal_handler(signal.SIGTERM, lambda: _handle_sigint(loop))

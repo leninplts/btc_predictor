@@ -31,6 +31,13 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 
+# Cargar .env antes de cualquier import que lea variables de entorno
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import pandas as pd
 from loguru import logger
 
@@ -422,12 +429,16 @@ async def main() -> None:
     telegram_app = await start_telegram_polling(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
     # 7. Notificar startup
+    collect_str = "ACTIVA" if storage.DATA_COLLECTION_ENABLED else "DESACTIVADA"
+    logger.info(f"Recoleccion de datos: {collect_str}")
+
     if notifier:
         await notifier.notify_startup({
             "capital": INITIAL_CAPITAL,
             "model_loaded": engine.predictor.is_loaded(),
             "paper_mode": True,
             "db_backend": "PostgreSQL" if storage.USE_POSTGRES else "SQLite",
+            "data_collection": storage.DATA_COLLECTION_ENABLED,
         })
 
     # 8. Lanzar tareas

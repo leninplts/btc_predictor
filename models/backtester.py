@@ -25,6 +25,7 @@ import pandas as pd
 from loguru import logger
 from typing import Optional
 
+from data import storage
 from features.builder import build_training_dataset, ALL_FEATURE_COLS
 from models.predictor import Predictor
 
@@ -73,8 +74,10 @@ def run_backtest(
     logger.info("  BACKTEST")
     logger.info("=" * 60)
 
-    # 1. Construir dataset
-    result = build_training_dataset(min_markets=min_markets)
+    # 1. Construir dataset (conectando a la DB de produccion)
+    with storage.use_training_db():
+        result = build_training_dataset(min_markets=min_markets)
+
     if result is None:
         logger.error("No hay suficientes datos para backtest")
         return {"error": "insufficient_data"}
@@ -222,8 +225,16 @@ def run_backtest(
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-    from data.storage import init_db
-    init_db()
+    # Cargar .env para obtener TRAINING_DATABASE_URL
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+    except ImportError:
+        pass
+
+    # Recargar las URLs despues de dotenv
+    storage.TRAINING_DATABASE_URL = os.environ.get("TRAINING_DATABASE_URL", "")
+    storage.DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
     report = run_backtest(
         min_confidence=0.55,

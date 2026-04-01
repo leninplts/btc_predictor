@@ -8,6 +8,10 @@ Se selecciona automaticamente segun la variable de entorno DATABASE_URL:
   - Si DATABASE_URL existe -> PostgreSQL
   - Si no -> SQLite local en data/pipeline.db
 
+Variables de entorno:
+  - ENABLE_DATA_COLLECTION : true/false — controla si se escriben datos en la DB
+  - TRAINING_DATABASE_URL  : URL de la DB de produccion para entrenamiento local
+
 Tablas:
   - btc_prices          : precios BTC en tiempo real (Binance + Chainlink)
   - orderbook_snapshots : snapshots completos del order book de Polymarket
@@ -20,6 +24,7 @@ Tablas:
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from loguru import logger
@@ -31,6 +36,11 @@ from loguru import logger
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgres")
+
+# Recoleccion de datos: solo escribe en DB si esta habilitado
+# En local (dev) se pone false; en produccion (VPS) se pone true
+_collect_raw = os.environ.get("ENABLE_DATA_COLLECTION", "true").strip().lower()
+DATA_COLLECTION_ENABLED = _collect_raw in ("true", "1", "yes")
 
 if USE_POSTGRES:
     import psycopg2
@@ -48,13 +58,65 @@ PH = "%s" if USE_POSTGRES else "?"
 
 
 # ---------------------------------------------------------------------------
-# Conexion
+# Conexion a DB de produccion para entrenamiento
 # ---------------------------------------------------------------------------
 
+TRAINING_DATABASE_URL = os.environ.get("TRAINING_DATABASE_URL", "")
+
+# Estado mutable para el context manager use_training_db()
+_active_db_url: str = DATABASE_URL
+_active_use_postgres: bool = USE_POSTGRES
+_active_ph: str = PH
+
+
+@contextmanager
+def use_training_db():
+    """
+    Context manager que cambia temporalmente la conexion de storage
+    a la DB de produccion (TRAINING_DATABASE_URL) para entrenar el modelo.
+
+    Si TRAINING_DATABASE_URL no esta definida, usa DATABASE_URL normal.
+
+    Uso:
+        with storage.use_training_db():
+            result = build_training_dataset()
+    """
+    global _active_db_url, _active_use_postgres, _active_ph, PH
+
+    train_url = TRAINING_DATABASE_URL or DATABASE_URL
+    old_url = _active_db_url
+    old_pg = _active_use_postgres
+    old_ph = _active_ph
+
+    _active_db_url = train_url
+    _active_use_postgres = train_url.startswith("postgres")
+    _active_ph = "%s" if _active_use_postgres else "?"
+    PH = _active_ph  # actualizar tambien la variable publica
+
+    if _active_use_postgres and not old_pg:
+        # Asegurar que psycopg2 esta disponible
+        import psycopg2  # noqa: F811
+
+    logger.info(
+        f"Conexion de entrenamiento: "
+        f"{'PostgreSQL (' + train_url.split('@')[-1].split('/')[0] + ')' if _active_use_postgres else 'SQLite'}"
+    )
+
+    try:
+        yield
+    finally:
+        _active_db_url = old_url
+        _active_use_postgres = old_pg
+        _active_ph = old_ph
+        PH = old_ph  # restaurar
+
+
 def get_connection():
-    """Abre una conexion a la DB activa (PostgreSQL o SQLite)."""
-    if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+    """Abre una conexion a la DB activa (PostgreSQL o SQLite).
+    Respeta el context manager use_training_db() si esta activo."""
+    if _active_use_postgres:
+        import psycopg2  # noqa: F811
+        conn = psycopg2.connect(_active_db_url)
         conn.autocommit = False
         return conn
     else:
@@ -72,7 +134,7 @@ def _fetchone(cur, query: str, params: tuple = ()) -> Optional[dict]:
     row = cur.fetchone()
     if row is None:
         return None
-    if USE_POSTGRES:
+    if _active_use_postgres:
         cols = [desc[0] for desc in cur.description]
         return dict(zip(cols, row))
     return dict(row)
@@ -82,7 +144,7 @@ def _fetchall(cur, query: str, params: tuple = ()) -> list[dict]:
     """Ejecuta query y devuelve lista de dicts."""
     cur.execute(query, params)
     rows = cur.fetchall()
-    if USE_POSTGRES:
+    if _active_use_postgres:
         cols = [desc[0] for desc in cur.description]
         return [dict(zip(cols, row)) for row in rows]
     return [dict(r) for r in rows]
@@ -237,7 +299,9 @@ def init_db() -> None:
 
     backend = f"PostgreSQL ({DATABASE_URL.split('@')[-1].split('/')[0]})" if USE_POSTGRES \
               else f"SQLite ({os.path.abspath(SQLITE_PATH)})"
+    collect_status = "ACTIVA" if DATA_COLLECTION_ENABLED else "DESACTIVADA"
     logger.info(f"Base de datos inicializada: {backend}")
+    logger.info(f"Recoleccion de datos: {collect_status}")
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +323,9 @@ def _insert_or_ignore_prefix() -> str:
 # ---------------------------------------------------------------------------
 
 def insert_btc_price(source: str, symbol: str, price: float, ts: int) -> None:
-    """Guarda un tick de precio BTC."""
+    """Guarda un tick de precio BTC. No-op si DATA_COLLECTION_ENABLED=False."""
+    if not DATA_COLLECTION_ENABLED:
+        return
     conn = get_connection()
     try:
         conn.cursor().execute(
@@ -280,7 +346,9 @@ def insert_orderbook_snapshot(
     asks: list,
     hash_val: Optional[str] = None
 ) -> None:
-    """Guarda un snapshot completo del order book."""
+    """Guarda un snapshot completo del order book. No-op si DATA_COLLECTION_ENABLED=False."""
+    if not DATA_COLLECTION_ENABLED:
+        return
     conn = get_connection()
     try:
         conn.cursor().execute(
@@ -306,7 +374,9 @@ def insert_price_change(
     best_ask: Optional[float] = None,
     hash_val: Optional[str] = None
 ) -> None:
-    """Guarda un cambio de nivel en el order book."""
+    """Guarda un cambio de nivel en el order book. No-op si DATA_COLLECTION_ENABLED=False."""
+    if not DATA_COLLECTION_ENABLED:
+        return
     conn = get_connection()
     try:
         conn.cursor().execute(
@@ -330,7 +400,9 @@ def insert_last_trade(
     side: str,
     fee_rate_bps: Optional[str] = None
 ) -> None:
-    """Guarda el precio del ultimo trade ejecutado."""
+    """Guarda el precio del ultimo trade ejecutado. No-op si DATA_COLLECTION_ENABLED=False."""
+    if not DATA_COLLECTION_ENABLED:
+        return
     conn = get_connection()
     try:
         conn.cursor().execute(
@@ -417,7 +489,7 @@ def insert_resolved_market(
     try:
         cur = conn.cursor()
         # INSERT con ON CONFLICT DO NOTHING (compatible PG y SQLite)
-        if USE_POSTGRES:
+        if _active_use_postgres:
             cur.execute(
                 f"INSERT INTO resolved_markets "
                 f"(market_id, asset_id_yes, asset_id_no, question, slug, "

@@ -4,11 +4,12 @@ models/trainer.py
 Entrenamiento del modelo XGBoost para prediccion BTC Up/Down.
 
 Flujo:
-  1. Llama a features.builder.build_training_dataset() para obtener (X, y)
-  2. Split temporal 70/15/15 (train/val/test)
-  3. Entrena XGBoost con grid search de hiperparametros
-  4. Evalua en validation y test sets
-  5. Guarda modelo + metricas + feature importance
+  1. Conecta a la DB de produccion (TRAINING_DATABASE_URL) para leer datos
+  2. Llama a features.builder.build_training_dataset() para obtener (X, y)
+  3. Split temporal 70/15/15 (train/val/test)
+  4. Entrena XGBoost con grid search de hiperparametros
+  5. Evalua en validation y test sets
+  6. Guarda modelo + metricas + feature importance
 
 Uso:
   python -m models.trainer
@@ -33,6 +34,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix
 )
 
+from data import storage
 from features.builder import build_training_dataset, ALL_FEATURE_COLS
 
 
@@ -148,12 +150,14 @@ def train_model(
     Retorna dict con:
       {model, metrics_val, metrics_test, feature_importance, model_path}
     """
-    # 1. Construir dataset
+    # 1. Construir dataset (conectando a la DB de produccion)
     logger.info("=" * 60)
     logger.info("  ENTRENAMIENTO DEL MODELO")
     logger.info("=" * 60)
 
-    result = build_training_dataset(min_markets=min_markets)
+    with storage.use_training_db():
+        result = build_training_dataset(min_markets=min_markets)
+
     if result is None:
         logger.error("No hay suficientes datos para entrenar")
         return {"error": "insufficient_data"}
@@ -279,8 +283,16 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-    from data.storage import init_db
-    init_db()
+    # Cargar .env para obtener TRAINING_DATABASE_URL
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+    except ImportError:
+        pass
+
+    # Recargar las URLs despues de dotenv
+    storage.TRAINING_DATABASE_URL = os.environ.get("TRAINING_DATABASE_URL", "")
+    storage.DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
     fast = "--fast" in sys.argv
     result = train_model(min_markets=30, fast_mode=fast)

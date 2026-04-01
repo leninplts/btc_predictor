@@ -23,7 +23,7 @@ import asyncio
 from typing import Optional
 from loguru import logger
 
-from telegram import Bot, Update
+from telegram import Bot, BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 
@@ -322,6 +322,20 @@ async def start_telegram_polling(token: str = "", chat_id: str = "") -> Optional
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+
+    # Registrar comandos en el menu de Telegram (para que aparezca el boton /)
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("balance",   "Capital, PnL, win rate"),
+            BotCommand("stats",     "Estadisticas completas"),
+            BotCommand("positions", "Posiciones abiertas"),
+            BotCommand("trades",    "Ultimos 5 trades cerrados"),
+            BotCommand("reset",     "Resetear wallet demo"),
+            BotCommand("help",      "Lista de comandos"),
+        ])
+        logger.debug("Comandos de Telegram registrados en el menu")
+    except Exception as e:
+        logger.warning(f"No se pudieron registrar comandos en Telegram: {e}")
 
     logger.success("Telegram polling iniciado — comandos disponibles")
     return app

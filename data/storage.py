@@ -193,6 +193,24 @@ def init_db() -> None:
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_rm_ts ON resolved_markets(ts_resolved)")
 
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS active_markets (
+            id              {_PG_PK},
+            market_id       TEXT NOT NULL UNIQUE,
+            asset_id_yes    TEXT NOT NULL,
+            asset_id_no     TEXT NOT NULL,
+            question        TEXT,
+            slug            TEXT,
+            description     TEXT,
+            status          TEXT DEFAULT 'active',
+            ts_discovered   BIGINT NOT NULL,
+            ts_updated      BIGINT NOT NULL,
+            dt_discovered   TEXT,
+            dt_updated      TEXT
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_am_status ON active_markets(status)")
+
     # Migracion: agregar columnas dt_* legibles si las tablas ya existian
     _migrations = [
         ("btc_prices",          ["dt"]),
@@ -213,25 +231,6 @@ def init_db() -> None:
             except Exception:
                 if USE_POSTGRES:
                     cur.execute("ROLLBACK TO SAVEPOINT migration_sp")
-                pass  # columna ya existe
-
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS active_markets (
-            id              {_PG_PK},
-            market_id       TEXT NOT NULL UNIQUE,
-            asset_id_yes    TEXT NOT NULL,
-            asset_id_no     TEXT NOT NULL,
-            question        TEXT,
-            slug            TEXT,
-            description     TEXT,
-            status          TEXT DEFAULT 'active',
-            ts_discovered   BIGINT NOT NULL,
-            ts_updated      BIGINT NOT NULL,
-            dt_discovered   TEXT,
-            dt_updated      TEXT
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_am_status ON active_markets(status)")
 
     conn.commit()
     conn.close()

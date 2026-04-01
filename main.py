@@ -155,7 +155,8 @@ async def resolved_markets_poller(state: BotState) -> None:
     # Pre-cargar los que ya estan en la DB
     conn = storage.get_connection()
     try:
-        rows = conn.execute("SELECT market_id FROM resolved_markets").fetchall()
+        cur = conn.cursor()
+        rows = storage._fetchall(cur, "SELECT market_id FROM resolved_markets")
         already_resolved = {row["market_id"] for row in rows}
         if already_resolved:
             logger.info(f"Poller: {len(already_resolved)} mercados ya resueltos en DB")

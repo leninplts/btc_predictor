@@ -27,10 +27,10 @@ logs/
 # ============================================================
 # MODELOS ENTRENADOS (archivos grandes)
 # ============================================================
-models/*.pkl
+# models/*.pkl        ← INCLUIDOS en git para deploy (modelo demo)
+# models/*.json       ← INCLUIDOS en git (reportes de entrenamiento)
 models/*.joblib
 models/*.model
-models/*.json
 models/*.bin
 models/*.pt
 models/*.pth

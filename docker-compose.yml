@@ -1,35 +1,10 @@
 services:
-  # --- PostgreSQL ---
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-bot_cripto}
-      POSTGRES_USER: ${POSTGRES_USER:-bot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      # Exponer el puerto para conectarte desde tu PC con DBeaver/pgAdmin
-      - "${POSTGRES_PORT:-5432}:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # --- Bot pipeline ---
   bot:
     build: .
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # host network para acceder a PostgreSQL en 127.0.0.1:5432 del VPS
+    network_mode: host
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-bot_cripto}
-    # Variables extra si las necesitas
+      DATABASE_URL: ${DATABASE_URL}
     env_file:
       - .env
-
-volumes:
-  pgdata:

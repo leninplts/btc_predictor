@@ -41,8 +41,8 @@ class OpenPosition:
     token_id: str
     buy_price: float      # precio al que compramos
     n_shares: float       # cantidad de shares
-    usdc_invested: float  # USDC total invertido (incluyendo fee)
-    fee_paid: float
+    usdc_invested: float  # USDC invertido en shares (sin fee): n_shares * buy_price
+    fee_paid: float       # fee pagado (separado del costo de shares)
     timestamp_ms: int
     prob_up: float        # prediccion del modelo al momento de entrar
     confidence: float
@@ -101,9 +101,18 @@ class PaperWallet:
     ) -> bool:
         """
         Abre una posicion en un mercado.
+
+        Simula el flujo real de Polymarket:
+          - Costo de shares = n_shares * buy_price
+          - Fee se paga aparte
+          - Total debitado del capital = costo_shares + fee
+
         Retorna True si se pudo abrir, False si no hay capital suficiente.
         """
-        total_cost = usdc_amount
+        # Costo real: shares + fee (como en Polymarket real)
+        shares_cost = n_shares * buy_price
+        total_cost = shares_cost + fee
+
         if total_cost > self.capital:
             logger.warning(
                 f"Capital insuficiente: necesita ${total_cost:.2f} "
@@ -125,7 +134,7 @@ class PaperWallet:
             token_id=token_id,
             buy_price=buy_price,
             n_shares=n_shares,
-            usdc_invested=usdc_amount,
+            usdc_invested=shares_cost,   # solo costo de shares, sin fee
             fee_paid=fee,
             timestamp_ms=int(time.time() * 1000),
             prob_up=prob_up,
@@ -135,8 +144,8 @@ class PaperWallet:
 
         logger.info(
             f"PAPER OPEN | {action} {slug} | "
-            f"{n_shares:.1f} shares @ {buy_price:.3f} | "
-            f"${usdc_amount:.2f} | fee ${fee:.4f} | "
+            f"{n_shares:.1f} shares @ {buy_price:.4f} | "
+            f"costo ${shares_cost:.2f} + fee ${fee:.4f} = ${total_cost:.2f} | "
             f"capital restante: ${self.capital:.2f}"
         )
         return True
@@ -162,20 +171,25 @@ class PaperWallet:
             (pos.action == "BUY_NO" and winning_outcome == "No")
         )
 
-        # PnL
+        # PnL (simula flujo real de Polymarket)
+        # usdc_invested = costo de shares (sin fee)
+        # fee_paid = fee aparte
+        # Total gastado = usdc_invested + fee_paid
+        total_spent = pos.usdc_invested + pos.fee_paid
+
         if won:
-            # Recibimos $1.00 por share
+            # Recibimos $1.00 por share (payout)
             payout = pos.n_shares * 1.0
-            pnl = payout - pos.usdc_invested
+            pnl = payout - total_spent
         else:
             # Recibimos $0.00 por share
-            pnl = -pos.usdc_invested
+            pnl = -total_spent
 
-        pnl_pct = (pnl / pos.usdc_invested * 100) if pos.usdc_invested > 0 else 0.0
+        pnl_pct = (pnl / total_spent * 100) if total_spent > 0 else 0.0
 
-        # Actualizar capital
+        # Actualizar capital: si ganamos, recibimos el payout completo
         if won:
-            self.capital += pos.usdc_invested + pnl  # devolver inversion + ganancia
+            self.capital += payout  # shares se convierten a $1.00 cada una
         # Si perdemos, ya se descontaron los USDC al abrir
 
         close_ts = int(time.time() * 1000)
@@ -210,7 +224,10 @@ class PaperWallet:
 
     def get_balance(self) -> dict:
         """Devuelve el estado completo de la wallet."""
-        total_invested = sum(p.usdc_invested for p in self.open_positions.values())
+        # Total invertido = costo de shares + fees de posiciones abiertas
+        total_invested = sum(
+            p.usdc_invested + p.fee_paid for p in self.open_positions.values()
+        )
         total_equity = self.capital + total_invested  # aproximacion
 
         n_trades = len(self.closed_trades)

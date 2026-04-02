@@ -7,11 +7,15 @@ Polymarket requiere heartbeats periodicos para mantener las limit orders
 vivas. Si no recibe un heartbeat en ~10 segundos, cancela automaticamente
 todas las ordenes abiertas de esa sesion (Dead Man's Switch).
 
+Flujo correcto:
+  1. Al activar: enviar post_heartbeat(None) → server retorna heartbeat_id
+  2. Cada 5s: enviar post_heartbeat(heartbeat_id) con el ID recibido
+  3. Al desactivar: dejar de enviar
+
 Se ejecuta como tarea asyncio en paralelo con el resto del bot.
 """
 
 import asyncio
-import uuid
 from loguru import logger
 from typing import Optional
 
@@ -35,7 +39,7 @@ class HeartbeatManager:
         """
         self.poly_client = poly_client
         self.interval = interval
-        self.session_id: str = str(uuid.uuid4())[:16]
+        self._heartbeat_id: Optional[str] = None  # ID asignado por el server
         self.running: bool = False
         self.active: bool = False  # True cuando hay ordenes limit activas
         self._consecutive_failures: int = 0
@@ -44,18 +48,23 @@ class HeartbeatManager:
     async def start(self) -> None:
         """Inicia el loop de heartbeat. Corre indefinidamente."""
         self.running = True
-        logger.info(f"Heartbeat manager iniciado | session={self.session_id} | interval={self.interval}s")
+        logger.info(f"Heartbeat manager iniciado | interval={self.interval}s")
 
         while self.running:
             try:
                 if self.active and self.poly_client.is_ready():
-                    # Ejecutar en thread separado para no bloquear el event loop
-                    await asyncio.to_thread(
-                        self.poly_client.clob.post_heartbeat, self.session_id
+                    # Enviar heartbeat en thread separado (SDK es sincrono)
+                    resp = await asyncio.to_thread(
+                        self.poly_client.clob.post_heartbeat, self._heartbeat_id
                     )
+
+                    # El server retorna el heartbeat_id; guardarlo para reusarlo
+                    if isinstance(resp, dict) and "heartbeat_id" in resp:
+                        self._heartbeat_id = resp["heartbeat_id"]
+
                     self._consecutive_failures = 0
-                    logger.debug(f"Heartbeat enviado | session={self.session_id}")
-                
+                    logger.debug(f"Heartbeat OK | id={self._heartbeat_id}")
+
                 await asyncio.sleep(self.interval)
 
             except Exception as e:
@@ -79,15 +88,19 @@ class HeartbeatManager:
         """Activa el envio de heartbeats (cuando hay limit orders abiertas)."""
         if not self.active:
             self.active = True
+            # Resetear ID para que el primer heartbeat cree una nueva sesion
+            self._heartbeat_id = None
             logger.debug("Heartbeat activado — limit orders activas")
 
     def deactivate(self) -> None:
         """Desactiva el envio de heartbeats (sin limit orders)."""
         if self.active:
             self.active = False
+            self._heartbeat_id = None
             logger.debug("Heartbeat desactivado — sin limit orders")
 
     def stop(self) -> None:
         """Detiene el loop de heartbeat."""
         self.running = False
         self.active = False
+        self._heartbeat_id = None

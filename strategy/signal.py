@@ -141,19 +141,19 @@ class SignalGenerator:
             buy_side_price = 1.0 - ob_midpoint  # el share NO es el complemento
 
         # ----- Tipo de orden -----
+        # Siempre limit order: los mercados BTC 5-min de Polymarket tienen
+        # poca liquidez y las market orders (FOK) fallan con "no match".
+        # Con alta confianza usamos un offset menor (mas agresivo, mas probable fill).
         if confidence >= cfg["high_confidence"]:
-            # Alta confianza: market order (queremos entrar seguro)
-            order_type = "market"
-            target_price = buy_side_price
-            reason_price = "market order (alta confianza)"
+            offset = cfg["limit_offset_high_conf"]
+            reason_price = f"limit agresivo @ offset={offset} (alta confianza)"
         else:
-            # Confianza normal: limit order para mejorar precio
             offset = cfg["limit_offset"]
-            if confidence >= 0.62:
-                offset = cfg["limit_offset_high_conf"]
-            target_price = max(0.01, buy_side_price - offset)
-            order_type = "limit"
-            reason_price = f"limit @ {target_price:.3f} (midpoint {buy_side_price:.3f} - {offset})"
+            reason_price = f"limit @ offset={offset}"
+
+        target_price = max(0.01, min(0.99, buy_side_price - offset))
+        order_type = "limit"
+        reason_price += f" | precio={target_price:.4f} (midpoint={buy_side_price:.3f})"
 
         # ----- Ajuste por regimen choppy -----
         regime_note = ""

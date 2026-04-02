@@ -121,12 +121,11 @@ class OrderManager:
         if not self.poly_client.is_ready():
             return self._error_result("Polymarket client no inicializado")
 
-        if order_type == "limit":
-            return await self._place_limit_with_fallback(
-                token_id, price, size, usdc_amount
-            )
-        else:
-            return await self._place_market_order(token_id, usdc_amount or (price * size))
+        # Siempre usar limit orders — los mercados BTC 5-min tienen poca
+        # liquidez y las market orders FOK fallan con "no match"
+        return await self._place_limit_with_fallback(
+            token_id, price, size, usdc_amount
+        )
 
     # -----------------------------------------------------------------------
     # Limit order con fallback a market
@@ -135,14 +134,26 @@ class OrderManager:
     async def _place_limit_with_fallback(
         self, token_id: str, price: float, size: float, usdc_amount: float
     ) -> OrderResult:
-        """Envia limit order. Si no se llena en timeout, cancela y envia market."""
+        """
+        Envia limit order. Si no se llena en timeout, cancela y reintenta
+        con precio mas agresivo (2 centavos mas alto).
 
-        # 1. Enviar limit order
+        Los mercados BTC 5-min de Polymarket tienen poca liquidez,
+        por lo que market orders (FOK) suelen fallar con 'no match'.
+        Siempre usamos limit orders.
+        """
+
+        # 1. Enviar limit order al precio target
         limit_result = await self._submit_limit_order(token_id, price, size)
 
         if not limit_result.success:
-            logger.warning(f"Limit order fallo: {limit_result.error}. Intentando market...")
-            return await self._place_market_order(token_id, usdc_amount or (price * size))
+            # Reintentar con precio mas agresivo (+2 centavos)
+            retry_price = min(0.99, price + 0.02)
+            logger.warning(
+                f"Limit order fallo: {limit_result.error}. "
+                f"Reintentando a precio mas agresivo: ${retry_price:.4f}"
+            )
+            return await self._submit_limit_order(token_id, retry_price, size)
 
         order_id = limit_result.order_id
         self.heartbeat.activate()
@@ -160,14 +171,29 @@ class OrderManager:
             )
             return real_result
 
-        # 3. No se lleno — cancelar y resubmit como market
-        logger.info(f"Limit order timeout ({LIMIT_ORDER_TIMEOUT_S}s). Cancelando...")
+        # 3. No se lleno — cancelar y reintentar con precio mas agresivo
+        logger.info(f"Limit order timeout ({LIMIT_ORDER_TIMEOUT_S}s). Reintentando mas agresivo...")
         await self._cancel_order(order_id)
         self.heartbeat.deactivate()
 
-        market_result = await self._place_market_order(token_id, usdc_amount or (price * size))
-        market_result.was_upgraded = True
-        return market_result
+        retry_price = min(0.99, price + 0.02)
+        retry_result = await self._submit_limit_order(token_id, retry_price, size)
+        if retry_result.success:
+            retry_result.was_upgraded = True
+            # Esperar fill breve (30s) para el retry
+            self.heartbeat.activate()
+            filled2 = await self._wait_for_fill(retry_result.order_id, timeout_s=30)
+            self.heartbeat.deactivate()
+            if filled2:
+                real = await self._fetch_fill_details(retry_result.order_id, retry_result)
+                logger.success(f"Retry limit filled | shares={real.shares_filled:.1f} @ ${real.fill_price:.4f}")
+                return real
+            else:
+                await self._cancel_order(retry_result.order_id)
+                logger.warning("Retry limit tampoco se lleno. Orden cancelada.")
+                return self._error_result(f"Limit order no se lleno en 2 intentos (${price:.4f}, ${retry_price:.4f})")
+
+        return retry_result
 
     # -----------------------------------------------------------------------
     # Submit limit order

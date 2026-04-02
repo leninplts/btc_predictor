@@ -41,6 +41,7 @@ DEFAULT_SIZING_CONFIG = {
     "max_risk_per_trade": 0.05,    # maximo 5% del capital por trade
     "min_risk_per_trade": 0.005,   # minimo 0.5% (para que valga la pena)
     "min_capital":        10.0,    # no operar si capital < $10 USDC
+    "min_shares":         5.0,     # Polymarket requiere minimo 5 shares por orden
     "choppy_multiplier":  0.5,     # reducir tamano 50% en regimen choppy
 }
 
@@ -138,38 +139,66 @@ class PositionSizer:
         # ----- Limitar al rango permitido -----
         risk_pct = max(cfg["min_risk_per_trade"], min(kelly_frac, cfg["max_risk_per_trade"]))
 
-        # ----- Calcular monto -----
-        usdc_amount = capital * risk_pct
+        # ----- Calcular monto total disponible para esta operacion -----
+        usdc_budget = capital * risk_pct
 
         # ----- Fee estimado -----
-        n_shares = usdc_amount / buy_price
         fee_per_share = polymarket_fee(buy_price)
-        fee_total = fee_per_share * n_shares
 
-        # Ajustar monto para que despues del fee todavia alcance
-        usdc_net = usdc_amount - fee_total
-        if usdc_net <= 0:
+        # Calcular cuantas shares podemos comprar con el budget
+        # budget = n_shares * buy_price + n_shares * fee_per_share
+        # budget = n_shares * (buy_price + fee_per_share)
+        cost_per_share = buy_price + fee_per_share
+        if cost_per_share <= 0:
             return PositionSize(
                 usdc_amount=0, n_shares=0, kelly_raw=kelly_raw, kelly_fraction=kelly_frac,
-                risk_pct=risk_pct, fee_estimated=fee_total,
-                reason=f"Fee (${fee_total:.4f}) consume toda la posicion"
+                risk_pct=risk_pct, fee_estimated=0,
+                reason="Costo por share invalido"
             )
 
-        n_shares_net = usdc_net / buy_price
+        n_shares_net = usdc_budget / cost_per_share
+
+        # ----- Floor: minimo de shares (Polymarket requiere >= 5) -----
+        min_shares = cfg["min_shares"]
+        adjusted = False
+
+        if n_shares_net < min_shares:
+            n_shares_net = min_shares
+            adjusted = True
+
+        # Calcular costos finales
+        shares_cost = n_shares_net * buy_price     # costo puro de shares
+        fee_total = fee_per_share * n_shares_net    # fee aparte
+        total_cost = shares_cost + fee_total        # total debitado del capital
+
+        # Verificar que el capital alcance
+        if total_cost > capital:
+            return PositionSize(
+                usdc_amount=0, n_shares=0, kelly_raw=kelly_raw,
+                kelly_fraction=kelly_frac, risk_pct=risk_pct,
+                fee_estimated=fee_total,
+                reason=(
+                    f"Minimo {min_shares:.0f} shares requiere "
+                    f"${total_cost:.2f} pero capital es ${capital:.2f}"
+                )
+            )
+
+        risk_pct = total_cost / capital
 
         reason_parts = [
             f"Kelly raw={kelly_raw:.4f}",
             f"frac={kelly_frac:.4f}",
             f"risk={risk_pct:.3%} of ${capital:.2f}",
-            f"${usdc_amount:.2f} USDC",
+            f"shares=${shares_cost:.2f} + fee=${fee_total:.4f} = ${total_cost:.2f}",
             f"{n_shares_net:.1f} shares @ {buy_price:.3f}",
-            f"fee ~${fee_total:.4f}",
         ]
+        if adjusted:
+            reason_parts.append(f"AJUSTADO min {min_shares:.0f} shares")
         if is_choppy:
             reason_parts.append("CHOPPY x0.5")
 
         return PositionSize(
-            usdc_amount=round(usdc_amount, 4),
+            usdc_amount=round(shares_cost, 4),     # solo costo de shares (sin fee)
             n_shares=round(n_shares_net, 2),
             kelly_raw=round(kelly_raw, 6),
             kelly_fraction=round(kelly_frac, 6),

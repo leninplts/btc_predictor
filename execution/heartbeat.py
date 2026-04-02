@@ -49,7 +49,10 @@ class HeartbeatManager:
         while self.running:
             try:
                 if self.active and self.poly_client.is_ready():
-                    self.poly_client.clob.post_heartbeat(self.session_id)
+                    # Ejecutar en thread separado para no bloquear el event loop
+                    await asyncio.to_thread(
+                        self.poly_client.clob.post_heartbeat, self.session_id
+                    )
                     self._consecutive_failures = 0
                     logger.debug(f"Heartbeat enviado | session={self.session_id}")
                 

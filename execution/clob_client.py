@@ -85,12 +85,14 @@ class PolymarketClient:
             return False
 
         try:
-            # signature_type=0 = EOA directo (MetaMask)
+            # signature_type=2 = browser wallet proxy (MetaMask via Polymarket web)
+            # Polymarket crea un proxy contract cuando conectas MetaMask desde el sitio.
+            # Los fondos depositados viven en ese proxy, no en tu EOA directamente.
             self.clob = ClobClient(
                 host=CLOB_HOST,
                 key=private_key,
                 chain_id=CHAIN_ID,
-                signature_type=0,
+                signature_type=2,
                 funder=funder,
             )
             self.address = funder
@@ -186,7 +188,7 @@ class PolymarketClient:
     # -----------------------------------------------------------------------
 
     def get_usdc_balance(self) -> float:
-        """Devuelve el balance de USDC disponible en Polymarket."""
+        """Devuelve el balance de USDC disponible en Polymarket (en dolares)."""
         if not self.initialized:
             return 0.0
 
@@ -194,8 +196,10 @@ class PolymarketClient:
             result = self.clob.get_balance_allowance(
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
-            balance_str = result.get("balance", "0")
-            return float(balance_str)
+            balance_raw = float(result.get("balance", "0"))
+            # El balance SIEMPRE viene en unidades atomicas de USDC (6 decimales)
+            # Ej: 50000004 = $50.000004 USDC
+            return balance_raw / 1e6
         except Exception as e:
             logger.error(f"Error obteniendo balance USDC: {e}")
             return 0.0
@@ -212,8 +216,8 @@ class PolymarketClient:
                     token_id=token_id,
                 )
             )
-            balance_str = result.get("balance", "0")
-            return float(balance_str)
+            balance_raw = float(result.get("balance", "0"))
+            return balance_raw / 1e6
         except Exception as e:
             logger.error(f"Error obteniendo balance token: {e}")
             return 0.0

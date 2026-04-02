@@ -65,8 +65,8 @@ from execution.telegram_bot import (
 
 _TZ_LIMA = timezone(timedelta(hours=-5))
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8619893862:AAFeqiKfE__P-3Eu9Sfw8cz-Ys5WgF8cwKU")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1435277461")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 INITIAL_CAPITAL     = float(os.environ.get("BOT_INITIAL_CAPITAL", "1000"))
 MIN_CONFIDENCE      = float(os.environ.get("BOT_MIN_CONFIDENCE", "0.55"))
@@ -267,6 +267,7 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
                     price=decision.target_price,
                     size=decision.n_shares,
                     order_type=decision.order_type,
+                    usdc_amount=decision.usdc_amount,
                 )
 
                 if notifier:

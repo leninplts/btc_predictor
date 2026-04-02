@@ -199,6 +199,13 @@ _safety_ref = None
 _pending_confirmation: dict = {}
 
 
+def _is_authorized(update: Update) -> bool:
+    """Verifica que el mensaje venga del chat autorizado."""
+    if not TELEGRAM_CHAT_ID:
+        return True  # si no hay chat_id configurado, permitir todo
+    return str(update.effective_chat.id) == TELEGRAM_CHAT_ID
+
+
 def set_refs(wallet, engine, notifier, poly_client=None, order_manager=None, safety=None):
     """main.py llama esto para pasar las referencias."""
     global _wallet_ref, _engine_ref, _notifier_ref
@@ -214,6 +221,8 @@ def set_refs(wallet, engine, notifier, poly_client=None, order_manager=None, saf
 # --- /balance --- Balance real de Polymarket
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Balance real de Polymarket (USDC en la cuenta)."""
+    if not _is_authorized(update):
+        return
     if _poly_client_ref and _poly_client_ref.is_ready():
         usdc = _poly_client_ref.get_usdc_balance()
         mode = _engine_ref.get_mode_str() if _engine_ref else "?"
@@ -240,6 +249,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # --- /demobalance --- Balance del paper wallet
 async def cmd_demobalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Balance de la wallet demo (paper trading)."""
+    if not _is_authorized(update):
+        return
     if _wallet_ref is None:
         await update.message.reply_text("Wallet no inicializada")
         return
@@ -262,6 +273,8 @@ async def cmd_demobalance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- /stats ---
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _wallet_ref is None or _engine_ref is None:
         await update.message.reply_text("Bot no inicializado completamente")
         return
@@ -298,6 +311,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /positions ---
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _wallet_ref is None:
         await update.message.reply_text("Wallet no inicializada")
         return
@@ -319,6 +334,8 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- /trades ---
 async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _wallet_ref is None:
         await update.message.reply_text("Wallet no inicializada")
         return
@@ -342,6 +359,8 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # --- /mode ---
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Muestra el modo actual."""
+    if not _is_authorized(update):
+        return
     if _engine_ref is None:
         await update.message.reply_text("Engine no inicializado")
         return
@@ -365,6 +384,8 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /live --- Activar trading real (con confirmacion)
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _engine_ref is None:
         await update.message.reply_text("Engine no inicializado")
         return
@@ -397,6 +418,8 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /paper --- Volver a paper mode (con confirmacion)
 async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _engine_ref is None:
         await update.message.reply_text("Engine no inicializado")
         return
@@ -419,6 +442,8 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /pauselive --- Pausar nuevas entradas
 async def cmd_pauselive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _engine_ref is None:
         await update.message.reply_text("Engine no inicializado")
         return
@@ -430,6 +455,8 @@ async def cmd_pauselive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --- /stop --- EMERGENCY STOP
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Emergency stop: cancela ordenes + paper mode. Sin confirmacion."""
+    if not _is_authorized(update):
+        return
     if _engine_ref is None:
         await update.message.reply_text("Engine no inicializado")
         return
@@ -457,6 +484,8 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /reset ---
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     if _wallet_ref is None:
         await update.message.reply_text("Wallet no inicializada")
         return
@@ -475,6 +504,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- /help ---
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
     mode = _engine_ref.get_mode_str() if _engine_ref else "?"
     msg = (
         f"<b>COMANDOS</b> (Modo: {mode})\n\n"
@@ -502,6 +533,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Procesa respuestas de confirmacion para /live y /paper."""
+    if not _is_authorized(update):
+        return
     chat_id = str(update.effective_chat.id)
     pending = _pending_confirmation.pop(chat_id, None)
 

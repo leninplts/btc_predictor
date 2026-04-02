@@ -86,9 +86,9 @@ class TelegramNotifier:
         """Notifica que se detecto un nuevo mercado BTC 5-min."""
         btc_str = f"BTC: <b>${btc_price:,.2f}</b>\n" if btc_price else ""
         msg = (
-            f"\U0001F4E2 <b>NUEVO MERCADO DETECTADO</b>\n\n"
+            f"📢 <b>NUEVO MERCADO DETECTADO</b>\n\n"
             f"{btc_str}"
-            f"\U0001F3AF <code>{slug}</code>\n"
+            f"🎯 <code>{slug}</code>\n"
             f"{question}"
         )
         await self.send(msg)
@@ -96,30 +96,29 @@ class TelegramNotifier:
     async def notify_decision(self, decision_dict: dict, mode: str = "PAPER") -> None:
         d = decision_dict
         action = d.get("action", "SKIP")
-        mode_icon = "\U0001F7E2" if mode == "LIVE" else "\U0001F7E1"  # verde=live, amarillo=paper
+        mode_icon = "🟢" if mode == "LIVE" else "🟡"
 
         if action == "SKIP":
-            # Escapar caracteres HTML en la razon (puede contener < >)
             reason = (d.get("signal_reason", "")
                       .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
             msg = (
-                f"\U000026D4 <b>NO ENTRA</b> {mode_icon} {mode}\n\n"
+                f"⛔ <b>NO ENTRA</b> {mode_icon} {mode}\n\n"
                 f"Mercado: <code>{d.get('slug', '')}</code>\n"
                 f"Confianza: {d.get('confidence', 0):.1%}\n"
                 f"Regimen: {d.get('regime', '?')}\n"
                 f"Razon: {reason}"
             )
         else:
-            direction = "\U0001F4C8 UP" if action == "BUY_YES" else "\U0001F4C9 DOWN"
+            direction = "📈 UP" if action == "BUY_YES" else "📉 DOWN"
             msg = (
-                f"\U00002705 <b>ENTRADA</b> {mode_icon} {mode}\n\n"
+                f"✅ <b>ENTRADA</b> {mode_icon} {mode}\n\n"
                 f"Mercado: <code>{d.get('slug', '')}</code>\n"
                 f"Prediccion: <b>{direction}</b>\n"
                 f"Accion: <b>{action}</b>\n\n"
-                f"\U0001F4CA P(UP): {d.get('prob_up', 0):.1%} | P(DOWN): {d.get('prob_down', 0):.1%}\n"
+                f"📊 P(UP): {d.get('prob_up', 0):.1%} | P(DOWN): {d.get('prob_down', 0):.1%}\n"
                 f"Confianza: <b>{d.get('confidence', 0):.1%}</b>\n"
                 f"Regimen: {d.get('regime', '?')}\n\n"
-                f"\U0001F4B0 Precio entrada: <b>${d.get('target_price', 0):.4f}</b>\n"
+                f"💰 Precio entrada: <b>${d.get('target_price', 0):.4f}</b>\n"
                 f"Tipo orden: {d.get('order_type', '')}\n"
                 f"Monto: <b>${d.get('usdc_amount', 0):.2f}</b> ({d.get('n_shares', 0):.1f} shares)\n"
                 f"Fee est: ${d.get('fee_estimated', 0):.4f}"
@@ -129,9 +128,9 @@ class TelegramNotifier:
     async def notify_order_sent(self, order_result: dict) -> None:
         """Notifica que se envio una orden real a Polymarket."""
         if order_result.get("success"):
-            upgraded = " (limit\u2192market)" if order_result.get("was_upgraded") else ""
+            upgraded = " (limit→market)" if order_result.get("was_upgraded") else ""
             msg = (
-                f"\U0001F680 <b>ORDEN EJECUTADA</b>{upgraded}\n\n"
+                f"🚀 <b>ORDEN EJECUTADA</b>{upgraded}\n\n"
                 f"Tipo: {order_result.get('order_type', '?')}\n"
                 f"Shares: <b>{order_result.get('shares_filled', 0):.1f}</b>\n"
                 f"Precio: <b>${order_result.get('fill_price', 0):.4f}</b>\n"
@@ -140,7 +139,7 @@ class TelegramNotifier:
             )
         else:
             msg = (
-                f"\U0000274C <b>ORDEN FALLIDA</b>\n\n"
+                f"❌ <b>ORDEN FALLIDA</b>\n\n"
                 f"Error: {order_result.get('error', 'desconocido')}"
             )
         await self.send(msg)
@@ -151,20 +150,20 @@ class TelegramNotifier:
         won = t.get("won", False)
 
         if won:
-            icon = "\U0001F3C6"
+            icon = "🏆"
             result = "GANASTE"
         else:
-            icon = "\U0001F534"
+            icon = "🔴"
             result = "PERDISTE"
 
         btc_open = t.get("btc_open", 0)
         btc_close = t.get("btc_close", 0)
         btc_line = ""
         if btc_open and btc_close:
-            btc_dir = "\U0001F4C8" if btc_close > btc_open else "\U0001F4C9"
+            btc_dir = "📈" if btc_close > btc_open else "📉"
             btc_change = btc_close - btc_open
             btc_line = (
-                f"\n{btc_dir} BTC: ${btc_open:,.2f} \u2192 ${btc_close:,.2f} "
+                f"\n{btc_dir} BTC: ${btc_open:,.2f} → ${btc_close:,.2f} "
                 f"({btc_change:+,.2f})\n"
             )
 
@@ -173,8 +172,8 @@ class TelegramNotifier:
             f"Mercado: <code>{t.get('slug', '')}</code>\n"
             f"Apuesta: {t.get('action', '')} | Resultado: {t.get('outcome', '')}"
             f"{btc_line}\n"
-            f"\U0001F4B5 PnL: <b>${t.get('pnl', 0):+.2f}</b> ({t.get('pnl_pct', 0):+.1f}%)\n\n"
-            f"\U0001F4BC <b>Estado de cuenta (demo)</b>\n"
+            f"💵 PnL: <b>${t.get('pnl', 0):+.2f}</b> ({t.get('pnl_pct', 0):+.1f}%)\n\n"
+            f"💼 <b>Estado de cuenta (demo)</b>\n"
             f"Capital: ${balance.get('equity_total', 0):.2f}\n"
             f"PnL total: ${balance.get('pnl_total', 0):+.2f} ({balance.get('pnl_total_pct', 0):+.1f}%)\n"
             f"Win rate: {balance.get('win_rate', 0):.1%} "
@@ -185,27 +184,27 @@ class TelegramNotifier:
 
     async def notify_safety_triggered(self, message: str) -> None:
         """Notifica que se activo un mecanismo de seguridad."""
-        msg = f"\U0001F6A8 <b>ALERTA DE SEGURIDAD</b>\n\n{message}"
+        msg = f"🚨 <b>ALERTA DE SEGURIDAD</b>\n\n{message}"
         await self.send(msg)
 
     async def notify_mode_change(self, new_mode: str, reason: str = "") -> None:
         """Notifica cambio de modo."""
-        icon = "\U0001F7E2" if new_mode == "LIVE" else "\U0001F7E1"
+        icon = "🟢" if new_mode == "LIVE" else "🟡"
         msg = f"{icon} <b>MODO: {new_mode}</b>"
         if reason:
             msg += f"\n{reason}"
         await self.send(msg)
 
     async def notify_error(self, error_msg: str) -> None:
-        msg = f"\U000026A0 <b>ERROR</b>\n<code>{error_msg[:500]}</code>"
+        msg = f"⚠️ <b>ERROR</b>\n<code>{error_msg[:500]}</code>"
         await self.send(msg)
 
     async def notify_startup(self, stats: dict) -> None:
         data_status = "ACTIVA" if stats.get("data_collection") else "DESACTIVADA"
-        poly_icon = "\U00002705" if stats.get("poly_ready") else "\U0000274C"
-        model_icon = "\U00002705" if stats.get("model_loaded") else "\U0000274C"
+        poly_icon = "✅" if stats.get("poly_ready") else "❌"
+        model_icon = "✅" if stats.get("model_loaded") else "❌"
         msg = (
-            f"\U0001F916 <b>BOT INICIADO</b>\n\n"
+            f"🤖 <b>BOT INICIADO</b>\n\n"
             f"Capital demo: <b>${stats.get('capital', 0):.2f}</b> USDC\n"
             f"Modelo: {model_icon} {'Cargado' if stats.get('model_loaded') else 'NO cargado'}\n"
             f"Modo: <b>{stats.get('mode', 'PAPER')}</b>\n"
@@ -261,10 +260,23 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         mode = _engine_ref.get_mode_str() if _engine_ref else "?"
         daily = _safety_ref.get_daily_stats() if _safety_ref else {}
 
+        # Payouts pendientes de redeem
+        pending_line = ""
+        if _wallet_ref:
+            pending = _wallet_ref.get_pending_payouts()
+            if pending["count"] > 0:
+                s = "s" if pending["count"] > 1 else ""
+                pending_line = (
+                    f"\n⏳ <b>Payout pendiente:</b> ~${pending['total']:.2f} "
+                    f"({pending['count']} mercado{s} ganado{s} en proceso de redeem)\n"
+                    f"Balance estimado real: <b>${usdc + pending['total']:.2f}</b>\n"
+                )
+
         msg = (
-            f"<b>BALANCE REAL (Polymarket)</b>\n\n"
+            f"💰 <b>BALANCE REAL (Polymarket)</b>\n\n"
             f"USDC disponible: <b>${usdc:.2f}</b>\n"
-            f"Modo: {mode}\n\n"
+            f"Modo: {mode}\n"
+            f"{pending_line}\n"
             f"<b>Hoy:</b>\n"
             f"PnL: ${daily.get('daily_pnl', 0):+.2f} ({daily.get('daily_pnl_pct', 0):+.1f}%)\n"
             f"Trades: {daily.get('daily_trades', 0)} "
@@ -272,7 +284,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         msg = (
-            "<b>BALANCE REAL</b>\n\n"
+            "💰 <b>BALANCE REAL</b>\n\n"
             "Polymarket client no disponible.\n"
             "Configura POLY_PRIVATE_KEY y POLY_FUNDER_ADDRESS."
         )

@@ -84,6 +84,12 @@ class PaperWallet:
         self.closed_trades: list[ClosedTrade] = []
         self.total_fees_paid = 0.0
 
+        # Tracking de payouts pendientes de redeem en Polymarket
+        # Cuando ganamos un trade, el payout ($1 x shares) no llega al balance
+        # real de inmediato. Polymarket tarda minutos/horas en procesar el redeem.
+        # Este tracker nos permite mostrar en /balance cuanto payout esta pendiente.
+        self.pending_payouts: list[dict] = []  # [{slug, payout, ts}]
+
         logger.info(f"PaperWallet inicializada: ${initial_capital:.2f} USDC")
 
     def open_position(
@@ -190,6 +196,12 @@ class PaperWallet:
         # Actualizar capital: si ganamos, recibimos el payout completo
         if won:
             self.capital += payout  # shares se convierten a $1.00 cada una
+            # Registrar payout pendiente (en Polymarket real el redeem tarda)
+            self.pending_payouts.append({
+                "slug": pos.slug,
+                "payout": round(payout, 2),
+                "ts": int(time.time() * 1000),
+            })
         # Si perdemos, ya se descontaron los USDC al abrir
 
         close_ts = int(time.time() * 1000)
@@ -305,6 +317,23 @@ class PaperWallet:
             })
         return result
 
+    def get_pending_payouts(self) -> dict:
+        """Retorna info de payouts pendientes de redeem."""
+        total = sum(p["payout"] for p in self.pending_payouts)
+        return {
+            "count": len(self.pending_payouts),
+            "total": round(total, 2),
+            "details": self.pending_payouts,
+        }
+
+    def clear_pending_payout(self, slug: str) -> None:
+        """Marca un payout como recibido (cuando el balance real lo confirma)."""
+        self.pending_payouts = [p for p in self.pending_payouts if p["slug"] != slug]
+
+    def clear_all_pending_payouts(self) -> None:
+        """Limpia todos los payouts pendientes."""
+        self.pending_payouts.clear()
+
     def reset(self, new_capital: Optional[float] = None) -> None:
         """Resetea la wallet al estado inicial."""
         cap = new_capital if new_capital is not None else self.initial_capital
@@ -313,4 +342,5 @@ class PaperWallet:
         self.open_positions.clear()
         self.closed_trades.clear()
         self.total_fees_paid = 0.0
+        self.pending_payouts.clear()
         logger.info(f"PaperWallet reseteada: ${cap:.2f} USDC")

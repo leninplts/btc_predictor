@@ -397,7 +397,9 @@ async def resolved_markets_poller(state: BotState) -> None:
 # ---------------------------------------------------------------------------
 
 async def stats_loop(state: BotState) -> None:
-    """Cada minuto imprime stats de DB + wallet."""
+    """Cada minuto imprime stats de DB + wallet + limpieza de payouts."""
+    _last_balance_check: float = 0.0
+
     while state.running:
         await asyncio.sleep(STATS_INTERVAL)
         try:
@@ -408,6 +410,27 @@ async def stats_loop(state: BotState) -> None:
                         if state.last_btc_price_binance else "N/A"
 
             mode = engine.get_mode_str() if engine else "?"
+
+            # Verificar si payouts pendientes ya se procesaron
+            pending_str = ""
+            if wallet and poly_client and poly_client.is_ready():
+                pending = wallet.get_pending_payouts()
+                if pending["count"] > 0:
+                    current_usdc = poly_client.get_usdc_balance()
+                    # Si el balance real subio respecto al ultimo check,
+                    # probablemente los redeems se procesaron
+                    if current_usdc > _last_balance_check and _last_balance_check > 0:
+                        diff = current_usdc - _last_balance_check
+                        if diff >= pending["total"] * 0.8:  # 80% match
+                            wallet.clear_all_pending_payouts()
+                            logger.info(
+                                f"Payouts pendientes acreditados: "
+                                f"balance subio ${diff:+.2f} a ${current_usdc:.2f}"
+                            )
+                    _last_balance_check = current_usdc
+                    pending = wallet.get_pending_payouts()  # re-check
+                    if pending["count"] > 0:
+                        pending_str = f" | Payout pendiente: ~${pending['total']:.2f}"
 
             logger.info(
                 f"--- STATS [{datetime.now(_TZ_LIMA).strftime('%H:%M:%S Lima')}] [{mode}] ---\n"
@@ -420,7 +443,7 @@ async def stats_loop(state: BotState) -> None:
                 f"PnL: ${balance.get('pnl_total', 0):+.2f} ({balance.get('pnl_total_pct', 0):+.1f}%) | "
                 f"WR: {balance.get('win_rate', 0):.0%} "
                 f"({balance.get('wins', 0)}W/{balance.get('losses', 0)}L) | "
-                f"Open: {balance.get('posiciones_abiertas', 0)}"
+                f"Open: {balance.get('posiciones_abiertas', 0)}{pending_str}"
             )
         except Exception as e:
             logger.error(f"Error en stats loop: {e}")

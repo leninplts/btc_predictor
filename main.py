@@ -174,8 +174,11 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
     no_id     = market["asset_id_no"]
     question  = market.get("question", "")
 
+    # Precio BTC actual para la notificacion
+    btc_now = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
+
     if notifier:
-        await notifier.notify_new_market(slug, question)
+        await notifier.notify_new_market(slug, question, btc_price=btc_now)
 
     # Obtener datos para features
     conn = storage.get_connection()
@@ -365,6 +368,8 @@ async def resolved_markets_poller(state: BotState) -> None:
                                 "pnl": trade.pnl,
                                 "pnl_pct": trade.pnl_pct,
                                 "outcome": trade.winning_outcome,
+                                "btc_open": btc_open,
+                                "btc_close": btc_close,
                             },
                             balance
                         )

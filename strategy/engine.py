@@ -97,6 +97,12 @@ class StrategyEngine:
     """
     Motor principal de decision.
     Se instancia una vez al iniciar el bot y se llama cada nuevo mercado.
+
+    Modos de operacion (controlables via Telegram):
+      - paper_mode=True:  solo simulacion, paper wallet
+      - paper_mode=False: trading real + paper wallet tracking
+      - live_paused=True: no abre nuevas posiciones reales pero deja
+                          que las existentes se resuelvan normalmente
     """
 
     def __init__(
@@ -110,6 +116,7 @@ class StrategyEngine:
     ):
         self.capital = capital
         self.paper_mode = paper_mode
+        self.live_paused = False  # True = no nuevas entradas live, posiciones abiertas se resuelven
 
         # Sub-componentes
         self.predictor = Predictor(
@@ -134,6 +141,52 @@ class StrategyEngine:
             f"min_conf={min_confidence} | kelly_frac={kelly_fraction} | "
             f"model={'loaded' if self.predictor.is_loaded() else 'NOT loaded'}"
         )
+
+    # -----------------------------------------------------------------------
+    # Toggle de modo (llamado desde Telegram)
+    # -----------------------------------------------------------------------
+
+    def set_live_mode(self) -> str:
+        """Activa trading real. Retorna mensaje de confirmacion."""
+        self.paper_mode = False
+        self.live_paused = False
+        logger.success("Modo cambiado a LIVE TRADING")
+        return "LIVE TRADING activado"
+
+    def set_paper_mode(self) -> str:
+        """Activa modo paper. Retorna mensaje de confirmacion."""
+        self.paper_mode = True
+        self.live_paused = False
+        logger.info("Modo cambiado a PAPER TRADING")
+        return "PAPER TRADING activado"
+
+    def pause_live(self) -> str:
+        """Pausa nuevas entradas live (posiciones abiertas siguen). Retorna mensaje."""
+        if self.paper_mode:
+            return "Ya estas en modo PAPER, no hay nada que pausar"
+        self.live_paused = True
+        logger.info("Live PAUSADO — no se abriran nuevas posiciones reales")
+        return "LIVE PAUSADO — no se abriran nuevas posiciones, las abiertas se resuelven normalmente"
+
+    def resume_live(self) -> str:
+        """Reanuda entradas live despues de pausa."""
+        if self.paper_mode:
+            return "Estas en modo PAPER. Usa /live para activar trading real"
+        self.live_paused = False
+        logger.info("Live REANUDADO — se abriran nuevas posiciones reales")
+        return "LIVE REANUDADO — nuevas posiciones reales activas"
+
+    def should_execute_live(self) -> bool:
+        """True si el bot debe enviar ordenes reales para nuevas posiciones."""
+        return not self.paper_mode and not self.live_paused
+
+    def get_mode_str(self) -> str:
+        """Retorna string legible del modo actual."""
+        if self.paper_mode:
+            return "PAPER"
+        if self.live_paused:
+            return "LIVE (PAUSADO)"
+        return "LIVE"
 
     def decide(
         self,
@@ -258,5 +311,7 @@ class StrategyEngine:
             "total_skips":     skips,
             "current_capital": self.capital,
             "paper_mode":      self.paper_mode,
+            "live_paused":     self.live_paused,
+            "mode":            self.get_mode_str(),
             "model_loaded":    self.predictor.is_loaded(),
         }

@@ -5,17 +5,21 @@ Orquestador principal del bot de trading BTC en Polymarket.
 
 Flujo completo:
   1. Inicializa DB, verifica APIs, conecta Telegram
-  2. Lanza WebSockets (RTDS + Market Channel)
-  3. Cada nuevo mercado BTC 5-min:
+  2. Inicializa Polymarket CLOB client (si hay credenciales)
+  3. Lanza WebSockets (RTDS + Market Channel)
+  4. Lanza Heartbeat manager (para limit orders en modo live)
+  5. Cada nuevo mercado BTC 5-min:
      a. Genera features en tiempo real
      b. Modelo predice P(up)
      c. Estrategia decide: BUY_YES, BUY_NO o SKIP
-     d. Paper wallet abre posicion
-     e. Telegram notifica la decision
-  4. Cada mercado resuelto:
+     d. Paper wallet abre posicion (SIEMPRE, tracking)
+     e. Si modo LIVE: envia orden real via order_manager
+     f. Telegram notifica la decision
+  6. Cada mercado resuelto:
      a. Paper wallet cierra posicion y calcula PnL
-     b. Telegram notifica el resultado
-  5. Estadisticas cada 60 segundos
+     b. Safety manager verifica daily loss limit
+     c. Telegram notifica el resultado
+  7. Estadisticas cada 60 segundos
 
 Uso:
   python main.py
@@ -46,6 +50,10 @@ from data import rest_client as rest
 from data.websocket_client import BotState, run_pipeline
 from strategy.engine import StrategyEngine
 from execution.paper_wallet import PaperWallet
+from execution.clob_client import PolymarketClient
+from execution.order_manager import OrderManager
+from execution.heartbeat import HeartbeatManager
+from execution.safety import SafetyManager
 from execution.telegram_bot import (
     TelegramNotifier, set_refs, start_telegram_polling
 )
@@ -64,6 +72,7 @@ INITIAL_CAPITAL     = float(os.environ.get("BOT_INITIAL_CAPITAL", "1000"))
 MIN_CONFIDENCE      = float(os.environ.get("BOT_MIN_CONFIDENCE", "0.55"))
 MAX_RISK_PER_TRADE  = float(os.environ.get("BOT_MAX_RISK", "0.05"))
 KELLY_FRACTION      = float(os.environ.get("BOT_KELLY_FRACTION", "0.35"))
+DAILY_LOSS_LIMIT    = float(os.environ.get("BOT_DAILY_LOSS_LIMIT_PCT", "10"))
 
 MARKET_CHECK_INTERVAL  = 60
 RESOLVED_POLL_INTERVAL = 60
@@ -97,7 +106,11 @@ logger.add(
 notifier: TelegramNotifier = None
 wallet: PaperWallet = None
 engine: StrategyEngine = None
-_last_decision_market: str = ""  # para no decidir dos veces el mismo mercado
+poly_client: PolymarketClient = None
+order_manager: OrderManager = None
+heartbeat: HeartbeatManager = None
+safety: SafetyManager = None
+_last_decision_market: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +123,9 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
     Cuando detecta uno nuevo:
       1. Actualiza el estado
       2. Ejecuta el ciclo de decision del strategy engine
-      3. Si la decision es operar, abre posicion en paper wallet
-      4. Notifica por Telegram
+      3. Paper wallet abre posicion (SIEMPRE)
+      4. Si modo LIVE: envia orden real
+      5. Notifica por Telegram
     """
     global _last_decision_market
 
@@ -129,7 +143,6 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
                 question  = market.get("question", "")
 
                 if market_id != state.active_market_id:
-                    # Nuevo mercado detectado
                     storage.upsert_active_market(
                         market_id=market_id,
                         asset_id_yes=yes_id,
@@ -141,7 +154,6 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
                     state.update_market(market_id, yes_id, no_id, slug=slug)
                     logger.success(f"Nuevo mercado: {question} | {slug}")
 
-                    # --- Ciclo de decision ---
                     if market_id != _last_decision_market and engine is not None:
                         _last_decision_market = market_id
                         await _run_trading_decision(state, market)
@@ -162,14 +174,12 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
     no_id     = market["asset_id_no"]
     question  = market.get("question", "")
 
-    # Notificar nuevo mercado
     if notifier:
         await notifier.notify_new_market(slug, question)
 
     # Obtener datos para features
     conn = storage.get_connection()
     try:
-        # Ticks BTC recientes (ultima hora)
         cutoff_ms = int(time.time() * 1000) - 3600_000
         btc_rows = storage._fetchall(
             conn.cursor(),
@@ -178,7 +188,6 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
         )
         btc_ticks = pd.DataFrame(btc_rows) if btc_rows else None
 
-        # Ultimo snapshot del order book
         snap_row = storage._fetchone(
             conn.cursor(),
             "SELECT bids, asks FROM orderbook_snapshots ORDER BY ts DESC LIMIT 1"
@@ -186,21 +195,18 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
         bids = json.loads(snap_row["bids"]) if snap_row else []
         asks = json.loads(snap_row["asks"]) if snap_row else []
 
-        # Trades recientes
         trade_rows = storage._fetchall(
             conn.cursor(),
             "SELECT ts, price, size, side FROM last_trades ORDER BY ts DESC LIMIT 100"
         )
         trades_df = pd.DataFrame(trade_rows) if trade_rows else None
 
-        # Outcomes recientes
         outcome_rows = storage._fetchall(
             conn.cursor(),
             "SELECT winning_outcome FROM resolved_markets ORDER BY ts_resolved DESC LIMIT 15"
         )
         recent_outcomes = [r["winning_outcome"] for r in outcome_rows][::-1]
 
-        # Share price: usar ob_midpoint del ultimo snapshot
         if bids and asks:
             best_bid = float(bids[0].get("price", 0.5)) if bids else 0.5
             best_ask = float(asks[0].get("price", 0.5)) if asks else 0.5
@@ -227,10 +233,11 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
     )
 
     # Notificar decision por Telegram
+    mode = engine.get_mode_str()
     if notifier:
-        await notifier.notify_decision(decision.to_dict())
+        await notifier.notify_decision(decision.to_dict(), mode=mode)
 
-    # Si decide operar, abrir posicion en paper wallet
+    # --- PAPER WALLET: siempre (tracking) ---
     if decision.action != "SKIP" and decision.usdc_amount > 0:
         wallet.open_position(
             market_id=market_id,
@@ -244,6 +251,34 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
             prob_up=decision.prob_up,
             confidence=decision.confidence,
         )
+
+    # --- LIVE ORDER: solo si modo live activo y no pausado ---
+    if decision.action != "SKIP" and decision.usdc_amount > 0:
+        if engine.should_execute_live() and order_manager:
+            # Verificar safety
+            if safety and safety.is_circuit_breaker_active():
+                logger.warning("Circuit breaker activo — no se envia orden real")
+                if notifier:
+                    await notifier.notify_error("Orden no enviada: daily loss limit activo")
+            else:
+                logger.info(f"LIVE: enviando orden real | {decision.action} {slug}")
+                order_result = await order_manager.place_order(
+                    token_id=decision.token_id,
+                    price=decision.target_price,
+                    size=decision.n_shares,
+                    order_type=decision.order_type,
+                )
+
+                if notifier:
+                    await notifier.notify_order_sent({
+                        "success": order_result.success,
+                        "order_id": order_result.order_id,
+                        "order_type": order_result.order_type,
+                        "shares_filled": order_result.shares_filled,
+                        "usdc_spent": order_result.usdc_spent,
+                        "was_upgraded": order_result.was_upgraded,
+                        "error": order_result.error,
+                    })
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +350,7 @@ async def resolved_markets_poller(state: BotState) -> None:
                     f"| BTC ${btc_open or 0:,.2f} -> ${btc_close or 0:,.2f} ({direction})"
                 )
 
-                # --- Cerrar posicion en paper wallet ---
+                # --- Cerrar posicion en paper wallet (SIEMPRE) ---
                 trade = wallet.resolve_position(market_id, r["winning_outcome"])
                 if trade:
                     engine.update_capital(trade.pnl)
@@ -332,6 +367,18 @@ async def resolved_markets_poller(state: BotState) -> None:
                             },
                             balance
                         )
+
+                    # --- Safety check (solo relevante si hubo live trade) ---
+                    if safety and not engine.paper_mode:
+                        safety_result = safety.record_trade(trade.pnl, trade.won)
+                        if safety_result["limit_triggered"]:
+                            # Forzar paper mode
+                            engine.set_paper_mode()
+                            if order_manager:
+                                await order_manager.cancel_all_orders()
+                            if notifier:
+                                await notifier.notify_safety_triggered(safety_result["message"])
+                                await notifier.notify_mode_change("PAPER", "Daily loss limit activado")
 
         except Exception as e:
             logger.error(f"Error en resolved poller: {e}", exc_info=True)
@@ -354,14 +401,16 @@ async def stats_loop(state: BotState) -> None:
             price_str = f"${state.last_btc_price_binance:,.2f}" \
                         if state.last_btc_price_binance else "N/A"
 
+            mode = engine.get_mode_str() if engine else "?"
+
             logger.info(
-                f"--- STATS [{datetime.now(_TZ_LIMA).strftime('%H:%M:%S Lima')}] ---\n"
+                f"--- STATS [{datetime.now(_TZ_LIMA).strftime('%H:%M:%S Lima')}] [{mode}] ---\n"
                 f"  BTC: {price_str}\n"
                 f"  DB: prices={db_stats.get('btc_prices',0):,} | "
                 f"ob={db_stats.get('orderbook_snapshots',0):,} | "
                 f"trades={db_stats.get('last_trades',0):,} | "
                 f"resolved={db_stats.get('resolved_markets',0):,}\n"
-                f"  Wallet: ${balance.get('equity_total', 0):.2f} | "
+                f"  Demo: ${balance.get('equity_total', 0):.2f} | "
                 f"PnL: ${balance.get('pnl_total', 0):+.2f} ({balance.get('pnl_total_pct', 0):+.1f}%) | "
                 f"WR: {balance.get('win_rate', 0):.0%} "
                 f"({balance.get('wins', 0)}W/{balance.get('losses', 0)}L) | "
@@ -376,7 +425,7 @@ async def stats_loop(state: BotState) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global notifier, wallet, engine
+    global notifier, wallet, engine, poly_client, order_manager, heartbeat, safety
 
     logger.info("=" * 60)
     logger.info("  BOT CRIPTO — Polymarket BTC 5-min Predictor")
@@ -391,24 +440,56 @@ async def main() -> None:
     gamma_ok = rest.ping_gamma()
     logger.info(f"CLOB: {'OK' if clob_ok else 'FAIL'} | Gamma: {'OK' if gamma_ok else 'FAIL'}")
 
-    # 3. Inicializar componentes
+    # 3. Inicializar componentes base
     wallet = PaperWallet(initial_capital=INITIAL_CAPITAL)
     engine = StrategyEngine(
         capital=INITIAL_CAPITAL,
-        paper_mode=True,
+        paper_mode=True,  # Siempre arranca en paper, se cambia via /live
         min_confidence=MIN_CONFIDENCE,
         max_risk_per_trade=MAX_RISK_PER_TRADE,
         kelly_fraction=KELLY_FRACTION,
     )
     notifier = TelegramNotifier(token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID)
+    safety = SafetyManager(
+        daily_loss_limit_pct=DAILY_LOSS_LIMIT,
+        initial_capital=INITIAL_CAPITAL,
+    )
 
-    # Pasar referencias al modulo de telegram para los comandos
-    set_refs(wallet, engine, notifier)
+    # 4. Inicializar Polymarket CLOB client (opcional — solo si hay credenciales)
+    poly_client = PolymarketClient()
+    poly_ready = poly_client.initialize()
 
-    # 4. Estado compartido
+    if poly_ready:
+        # Verificar allowances
+        poly_client.ensure_allowances()
+
+        # Heartbeat y order manager
+        heartbeat = HeartbeatManager(poly_client)
+        order_manager = OrderManager(poly_client, heartbeat)
+
+        usdc = poly_client.get_usdc_balance()
+        logger.success(f"Polymarket LIVE disponible | USDC: ${usdc:.2f}")
+
+        # Actualizar capital de referencia del safety manager
+        if usdc > 0:
+            safety.update_reference_capital(usdc)
+    else:
+        logger.info("Polymarket LIVE no disponible (sin credenciales). Solo paper mode.")
+
+    # 5. Pasar referencias al modulo de telegram
+    set_refs(
+        wallet=wallet,
+        engine=engine,
+        notifier=notifier,
+        poly_client=poly_client if poly_ready else None,
+        order_manager=order_manager,
+        safety=safety,
+    )
+
+    # 6. Estado compartido
     state = BotState()
 
-    # 5. Primer discovery
+    # 7. Primer discovery
     logger.info("Buscando mercado BTC 5-min activo...")
     market = rest.get_active_btc_5m_market()
     if market:
@@ -425,10 +506,10 @@ async def main() -> None:
             market["asset_id_no"], slug=market.get("slug", "")
         )
 
-    # 6. Iniciar Telegram polling (comandos)
+    # 8. Iniciar Telegram polling (comandos)
     telegram_app = await start_telegram_polling(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
-    # 7. Notificar startup
+    # 9. Notificar startup
     collect_str = "ACTIVA" if storage.DATA_COLLECTION_ENABLED else "DESACTIVADA"
     logger.info(f"Recoleccion de datos: {collect_str}")
 
@@ -436,18 +517,23 @@ async def main() -> None:
         await notifier.notify_startup({
             "capital": INITIAL_CAPITAL,
             "model_loaded": engine.predictor.is_loaded(),
-            "paper_mode": True,
+            "mode": engine.get_mode_str(),
             "db_backend": "PostgreSQL" if storage.USE_POSTGRES else "SQLite",
             "data_collection": storage.DATA_COLLECTION_ENABLED,
+            "poly_ready": poly_ready,
         })
 
-    # 8. Lanzar tareas
+    # 10. Lanzar tareas
     tasks = [
         asyncio.create_task(run_pipeline(state),                    name="websockets"),
         asyncio.create_task(market_discovery_and_trade_loop(state), name="discovery_trade"),
         asyncio.create_task(resolved_markets_poller(state),         name="resolved_poller"),
         asyncio.create_task(stats_loop(state),                      name="stats"),
     ]
+
+    # Heartbeat solo si polymarket esta listo
+    if heartbeat:
+        tasks.append(asyncio.create_task(heartbeat.start(), name="heartbeat"))
 
     logger.success("Bot corriendo. Ctrl+C para detener.")
 
@@ -457,6 +543,10 @@ async def main() -> None:
         pass
     finally:
         state.stop()
+        if heartbeat:
+            heartbeat.stop()
+        if order_manager:
+            await order_manager.cancel_all_orders()
         for task in tasks:
             task.cancel()
         if telegram_app:

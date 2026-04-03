@@ -98,7 +98,7 @@ class StrategyEngine:
     Motor principal de decision.
     Se instancia una vez al iniciar el bot y se llama cada nuevo mercado.
 
-    Modos de operacion (controlables via Telegram):
+    Modos de operacion:
       - paper_mode=True:  solo simulacion, paper wallet
       - paper_mode=False: trading real + paper wallet tracking
       - live_paused=True: no abre nuevas posiciones reales pero deja
@@ -143,7 +143,7 @@ class StrategyEngine:
         )
 
     # -----------------------------------------------------------------------
-    # Toggle de modo (llamado desde Telegram)
+    # Toggle de modo
     # -----------------------------------------------------------------------
 
     def set_live_mode(self) -> str:

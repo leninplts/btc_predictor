@@ -11,8 +11,6 @@ Funcionalidades:
 Cuando se activa el daily loss limit:
   1. Cancela todas las ordenes abiertas
   2. Cambia el bot a paper mode
-  3. Notifica por Telegram
-  4. Solo el usuario puede reactivar live con /live
 """
 
 import os

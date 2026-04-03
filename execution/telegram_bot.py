@@ -27,8 +27,12 @@ COMANDOS (el usuario envia al bot):
 
 import os
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from loguru import logger
+
+# Zona horaria UTC-5 (Lima, Bogota, etc.)
+_TZ_UTC5 = timezone(timedelta(hours=-5))
 
 from telegram import Bot, BotCommand, Update
 from telegram.ext import (
@@ -79,31 +83,46 @@ class TelegramNotifier:
             logger.error(f"Error enviando mensaje Telegram: {e}")
             return False
 
+    # --- Helpers ---
+
+    @staticmethod
+    def _now_utc5() -> str:
+        """Retorna la hora actual en UTC-5 formateada."""
+        return datetime.now(_TZ_UTC5).strftime("%H:%M:%S")
+
     # --- Mensajes pre-formateados ---
 
     async def notify_new_market(self, slug: str, question: str = "",
                                 btc_price: float = 0.0) -> None:
         """Notifica que se detecto un nuevo mercado BTC 5-min."""
+        hora = self._now_utc5()
         btc_str = f"BTC: <b>${btc_price:,.2f}</b>\n" if btc_price else ""
         msg = (
-            f"📢 <b>NUEVO MERCADO DETECTADO</b>\n\n"
+            f"📢 <b>NUEVO MERCADO DETECTADO</b>\n"
+            f"🕐 {hora} (UTC-5)\n\n"
             f"{btc_str}"
             f"🎯 <code>{slug}</code>\n"
             f"{question}"
         )
         await self.send(msg)
 
-    async def notify_decision(self, decision_dict: dict, mode: str = "PAPER") -> None:
+    async def notify_decision(self, decision_dict: dict, mode: str = "PAPER",
+                              btc_price: float = 0.0) -> None:
         d = decision_dict
         action = d.get("action", "SKIP")
         mode_icon = "🟢" if mode == "LIVE" else "🟡"
+        btc_str = f"📍 BTC al decidir: <b>${btc_price:,.2f}</b>\n" if btc_price else ""
+
+        hora = self._now_utc5()
 
         if action == "SKIP":
             reason = (d.get("signal_reason", "")
                       .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
             msg = (
-                f"⛔ <b>NO ENTRA</b> {mode_icon} {mode}\n\n"
+                f"⛔ <b>NO ENTRA</b> {mode_icon} {mode}\n"
+                f"🕐 {hora} (UTC-5)\n\n"
                 f"Mercado: <code>{d.get('slug', '')}</code>\n"
+                f"{btc_str}"
                 f"Confianza: {d.get('confidence', 0):.1%}\n"
                 f"Regimen: {d.get('regime', '?')}\n"
                 f"Razon: {reason}"
@@ -111,8 +130,10 @@ class TelegramNotifier:
         else:
             direction = "📈 UP" if action == "BUY_YES" else "📉 DOWN"
             msg = (
-                f"✅ <b>ENTRADA</b> {mode_icon} {mode}\n\n"
+                f"✅ <b>ENTRADA</b> {mode_icon} {mode}\n"
+                f"🕐 {hora} (UTC-5)\n\n"
                 f"Mercado: <code>{d.get('slug', '')}</code>\n"
+                f"{btc_str}"
                 f"Prediccion: <b>{direction}</b>\n"
                 f"Accion: <b>{action}</b>\n\n"
                 f"📊 P(UP): {d.get('prob_up', 0):.1%} | P(DOWN): {d.get('prob_down', 0):.1%}\n"
@@ -127,10 +148,16 @@ class TelegramNotifier:
 
     async def notify_order_sent(self, order_result: dict) -> None:
         """Notifica que se envio una orden real a Polymarket."""
+        hora = self._now_utc5()
+        btc_price = order_result.get("btc_price", 0)
+        btc_str = f"📍 BTC al ejecutar: <b>${btc_price:,.2f}</b>\n" if btc_price else ""
+
         if order_result.get("success"):
-            upgraded = " (limit→market)" if order_result.get("was_upgraded") else ""
+            upgraded = " (reintento)" if order_result.get("was_upgraded") else ""
             msg = (
-                f"🚀 <b>ORDEN EJECUTADA</b>{upgraded}\n\n"
+                f"🚀 <b>ORDEN EJECUTADA</b>{upgraded}\n"
+                f"🕐 {hora} (UTC-5)\n\n"
+                f"{btc_str}"
                 f"Tipo: {order_result.get('order_type', '?')}\n"
                 f"Shares: <b>{order_result.get('shares_filled', 0):.1f}</b>\n"
                 f"Precio: <b>${order_result.get('fill_price', 0):.4f}</b>\n"
@@ -140,12 +167,42 @@ class TelegramNotifier:
         else:
             msg = (
                 f"❌ <b>ORDEN FALLIDA</b>\n\n"
+                f"{btc_str}"
                 f"Error: {order_result.get('error', 'desconocido')}"
             )
         await self.send(msg)
 
+    async def notify_market_resolved(self, slug: str, winning_outcome: str,
+                                     btc_open: float = 0, btc_close: float = 0,
+                                     had_position: bool = False) -> None:
+        """Notifica que un mercado se resolvio (siempre, tenga o no posicion)."""
+        if had_position:
+            return  # La notificacion de WIN/LOSS ya incluye la resolucion
+
+        hora = self._now_utc5()
+        btc_line = ""
+        if btc_open and btc_close:
+            btc_dir = "📈" if btc_close > btc_open else "📉"
+            btc_change = btc_close - btc_open
+            btc_line = (
+                f"{btc_dir} BTC: ${btc_open:,.2f} → ${btc_close:,.2f} "
+                f"({btc_change:+,.2f})\n"
+            )
+
+        outcome_icon = "🟢" if winning_outcome == "Yes" else "🔴"
+        msg = (
+            f"🏁 <b>MERCADO CERRADO</b>\n"
+            f"🕐 {hora} (UTC-5)\n\n"
+            f"<code>{slug}</code>\n"
+            f"Resultado: {outcome_icon} <b>{winning_outcome}</b>\n"
+            f"{btc_line}"
+            f"Sin posicion abierta"
+        )
+        await self.send(msg)
+
     async def notify_resolution(self, trade_dict: dict, balance: dict) -> None:
         """Notifica resolucion de un mercado con resultado del trade."""
+        hora = self._now_utc5()
         t = trade_dict
         won = t.get("won", False)
 
@@ -168,7 +225,8 @@ class TelegramNotifier:
             )
 
         msg = (
-            f"{icon} <b>{result}</b>\n\n"
+            f"{icon} <b>{result}</b>\n"
+            f"🕐 {hora} (UTC-5)\n\n"
             f"Mercado: <code>{t.get('slug', '')}</code>\n"
             f"Apuesta: {t.get('action', '')} | Resultado: {t.get('outcome', '')}"
             f"{btc_line}\n"
@@ -256,7 +314,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _is_authorized(update):
         return
     if _poly_client_ref and _poly_client_ref.is_ready():
-        usdc = _poly_client_ref.get_usdc_balance()
+        # Ejecutar en thread para no bloquear el event loop (SDK sincrono)
+        usdc = await asyncio.to_thread(_poly_client_ref.get_usdc_balance)
         mode = _engine_ref.get_mode_str() if _engine_ref else "?"
         daily = _safety_ref.get_daily_stats() if _safety_ref else {}
 

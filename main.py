@@ -235,10 +235,10 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
         recent_outcomes=recent_outcomes,
     )
 
-    # Notificar decision por Telegram
+    # Notificar decision por Telegram (incluir precio BTC actual)
     mode = engine.get_mode_str()
     if notifier:
-        await notifier.notify_decision(decision.to_dict(), mode=mode)
+        await notifier.notify_decision(decision.to_dict(), mode=mode, btc_price=btc_now)
 
     # --- PAPER WALLET: siempre (tracking) ---
     if decision.action != "SKIP" and decision.usdc_amount > 0:
@@ -274,14 +274,18 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
                 )
 
                 if notifier:
+                    # Precio BTC al momento de ejecutar la orden
+                    btc_at_order = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
                     await notifier.notify_order_sent({
                         "success": order_result.success,
                         "order_id": order_result.order_id,
                         "order_type": order_result.order_type,
+                        "fill_price": order_result.fill_price,
                         "shares_filled": order_result.shares_filled,
                         "usdc_spent": order_result.usdc_spent,
                         "was_upgraded": order_result.was_upgraded,
                         "error": order_result.error,
+                        "btc_price": btc_at_order,
                     })
 
 
@@ -372,6 +376,16 @@ async def resolved_markets_poller(state: BotState) -> None:
                                 "btc_close": btc_close,
                             },
                             balance
+                        )
+                else:
+                    # No habia posicion abierta, pero igual notificar el cierre del mercado
+                    if notifier:
+                        await notifier.notify_market_resolved(
+                            slug=r.get("slug", ""),
+                            winning_outcome=r["winning_outcome"],
+                            btc_open=btc_open,
+                            btc_close=btc_close,
+                            had_position=False,
                         )
 
                     # --- Safety check (solo relevante si hubo live trade) ---

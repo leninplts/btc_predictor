@@ -68,20 +68,29 @@ class TelegramNotifier:
         else:
             logger.warning("TelegramNotifier deshabilitado (falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID)")
 
-    async def send(self, message: str, parse_mode: str = "HTML") -> bool:
-        """Envia un mensaje al chat. Retorna True si exito."""
+    async def send(self, message: str, parse_mode: str = "HTML", retries: int = 2) -> bool:
+        """Envia un mensaje al chat con reintentos. Retorna True si exito."""
         if not self.enabled or not self.bot:
             return False
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode=parse_mode,
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error enviando mensaje Telegram: {e}")
-            return False
+        for attempt in range(1, retries + 1):
+            try:
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=message,
+                    parse_mode=parse_mode,
+                    read_timeout=15,
+                    write_timeout=15,
+                    connect_timeout=10,
+                )
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Telegram send intento {attempt}/{retries} fallo: {e}"
+                )
+                if attempt < retries:
+                    await asyncio.sleep(2 * attempt)
+        logger.error(f"Telegram send fallo despues de {retries} intentos")
+        return False
 
     # --- Helpers ---
 
@@ -296,6 +305,28 @@ def _is_authorized(update: Update) -> bool:
     return str(update.effective_chat.id) == TELEGRAM_CHAT_ID
 
 
+async def _safe_reply(
+    update: Update, text: str, parse_mode: str = "HTML", retries: int = 2
+) -> bool:
+    """reply_text protegido contra TimedOut con reintentos."""
+    for attempt in range(1, retries + 1):
+        try:
+            await update.message.reply_text(
+                text,
+                parse_mode=parse_mode,
+                read_timeout=15,
+                write_timeout=15,
+                connect_timeout=10,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"reply_text intento {attempt}/{retries} fallo: {e}")
+            if attempt < retries:
+                await asyncio.sleep(2 * attempt)
+    logger.error(f"reply_text fallo despues de {retries} intentos")
+    return False
+
+
 def set_refs(wallet, engine, notifier, poly_client=None, order_manager=None, safety=None):
     """main.py llama esto para pasar las referencias."""
     global _wallet_ref, _engine_ref, _notifier_ref
@@ -347,7 +378,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Polymarket client no disponible.\n"
             "Configura POLY_PRIVATE_KEY y POLY_FUNDER_ADDRESS."
         )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /demobalance --- Balance del paper wallet
@@ -356,7 +387,7 @@ async def cmd_demobalance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not _is_authorized(update):
         return
     if _wallet_ref is None:
-        await update.message.reply_text("Wallet no inicializada")
+        await _safe_reply(update, "Wallet no inicializada")
         return
 
     b = _wallet_ref.get_balance()
@@ -372,7 +403,7 @@ async def cmd_demobalance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Racha: {b['racha']}\n"
         f"Posiciones abiertas: {b['posiciones_abiertas']}"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /stats ---
@@ -380,7 +411,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _wallet_ref is None or _engine_ref is None:
-        await update.message.reply_text("Bot no inicializado completamente")
+        await _safe_reply(update, "Bot no inicializado completamente")
         return
 
     b = _wallet_ref.get_balance()
@@ -410,7 +441,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  {b['wins']}W / {b['losses']}L\n"
         f"  Racha actual: {b['racha']}"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /positions ---
@@ -418,12 +449,12 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_authorized(update):
         return
     if _wallet_ref is None:
-        await update.message.reply_text("Wallet no inicializada")
+        await _safe_reply(update, "Wallet no inicializada")
         return
 
     positions = _wallet_ref.get_open_positions_summary()
     if not positions:
-        await update.message.reply_text("Sin posiciones abiertas (demo)")
+        await _safe_reply(update, "Sin posiciones abiertas (demo)")
         return
 
     lines = ["<b>POSICIONES ABIERTAS (Demo)</b>\n"]
@@ -433,7 +464,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"    {p['n_shares']} shares @ ${p['buy_price']:.3f} = ${p['usdc']:.2f}\n"
             f"    Conf: {p['confidence']:.1%}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _safe_reply(update, "\n".join(lines))
 
 
 # --- /trades ---
@@ -441,12 +472,12 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _is_authorized(update):
         return
     if _wallet_ref is None:
-        await update.message.reply_text("Wallet no inicializada")
+        await _safe_reply(update, "Wallet no inicializada")
         return
 
     trades = _wallet_ref.get_recent_trades(n=5)
     if not trades:
-        await update.message.reply_text("Sin trades cerrados aun")
+        await _safe_reply(update, "Sin trades cerrados aun")
         return
 
     lines = ["<b>ULTIMOS TRADES (Demo)</b>\n"]
@@ -457,7 +488,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"${t['pnl']:+.2f} ({t['pnl_pct']:+.1f}%) | "
             f"conf {t['confidence']:.1%}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _safe_reply(update, "\n".join(lines))
 
 
 # --- /mode ---
@@ -466,7 +497,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _engine_ref is None:
-        await update.message.reply_text("Engine no inicializado")
+        await _safe_reply(update, "Engine no inicializado")
         return
 
     mode = _engine_ref.get_mode_str()
@@ -483,7 +514,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\nDaily loss limit: -{daily['loss_limit_pct']}%\n"
             f"Circuit breaker: {'ACTIVO' if daily['circuit_breaker'] else 'OK'}"
         )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /live --- Activar trading real (con confirmacion)
@@ -491,22 +522,22 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _engine_ref is None:
-        await update.message.reply_text("Engine no inicializado")
+        await _safe_reply(update, "Engine no inicializado")
         return
 
     if not _poly_client_ref or not _poly_client_ref.is_ready():
-        await update.message.reply_text(
+        await _safe_reply(update,
             "Polymarket client no disponible.\n"
             "Configura POLY_PRIVATE_KEY y POLY_FUNDER_ADDRESS."
         )
         return
 
     if not _engine_ref.paper_mode and not _engine_ref.live_paused:
-        await update.message.reply_text("Ya estas en modo LIVE")
+        await _safe_reply(update, "Ya estas en modo LIVE")
         return
 
     # Pedir confirmacion
-    usdc = _poly_client_ref.get_usdc_balance()
+    usdc = await asyncio.to_thread(_poly_client_ref.get_usdc_balance)
     chat_id = str(update.effective_chat.id)
     _pending_confirmation[chat_id] = "live"
 
@@ -517,7 +548,7 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Escribe <b>CONFIRMAR</b> para activar.\n"
         f"Cualquier otro mensaje cancela."
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /paper --- Volver a paper mode (con confirmacion)
@@ -525,11 +556,11 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _engine_ref is None:
-        await update.message.reply_text("Engine no inicializado")
+        await _safe_reply(update, "Engine no inicializado")
         return
 
     if _engine_ref.paper_mode:
-        await update.message.reply_text("Ya estas en modo PAPER")
+        await _safe_reply(update, "Ya estas en modo PAPER")
         return
 
     chat_id = str(update.effective_chat.id)
@@ -541,7 +572,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Escribe <b>CONFIRMAR</b> para cambiar.\n"
         f"Cualquier otro mensaje cancela."
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # --- /pauselive --- Pausar nuevas entradas
@@ -549,11 +580,11 @@ async def cmd_pauselive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_authorized(update):
         return
     if _engine_ref is None:
-        await update.message.reply_text("Engine no inicializado")
+        await _safe_reply(update, "Engine no inicializado")
         return
 
     msg = _engine_ref.pause_live()
-    await update.message.reply_text(msg)
+    await _safe_reply(update, msg, parse_mode=None)
 
 
 # --- /stop --- EMERGENCY STOP
@@ -562,7 +593,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _engine_ref is None:
-        await update.message.reply_text("Engine no inicializado")
+        await _safe_reply(update, "Engine no inicializado")
         return
 
     # 1. Cancelar todas las ordenes
@@ -580,7 +611,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"El bot seguira corriendo en modo paper.\n"
         f"Usa /live para reactivar trading real."
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
     if _notifier_ref:
         await _notifier_ref.notify_mode_change("PAPER", "Emergency stop activado por usuario")
@@ -591,7 +622,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     if _wallet_ref is None:
-        await update.message.reply_text("Wallet no inicializada")
+        await _safe_reply(update, "Wallet no inicializada")
         return
 
     _wallet_ref.reset()
@@ -599,10 +630,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _engine_ref.capital = _wallet_ref.capital
         _engine_ref.decisions.clear()
 
-    await update.message.reply_text(
+    await _safe_reply(update,
         f"Demo wallet reseteada a ${_wallet_ref.initial_capital:.2f} USDC\n"
-        f"Historial de trades demo eliminado",
-        parse_mode="HTML"
+        f"Historial de trades demo eliminado"
     )
 
 
@@ -628,7 +658,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset       — Resetear demo wallet\n"
         "/help        — Este mensaje"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -648,14 +678,14 @@ async def _handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (update.message.text or "").strip().upper()
 
     if text != "CONFIRMAR":
-        await update.message.reply_text("Accion cancelada.")
+        await _safe_reply(update, "Accion cancelada.", parse_mode=None)
         return
 
     if pending == "live" and _engine_ref:
         msg = _engine_ref.set_live_mode()
         if _safety_ref:
             _safety_ref.reset_circuit_breaker()
-        await update.message.reply_text(f"<b>{msg}</b>", parse_mode="HTML")
+        await _safe_reply(update, f"<b>{msg}</b>")
         if _notifier_ref:
             await _notifier_ref.notify_mode_change("LIVE", "Activado por usuario")
 
@@ -664,7 +694,7 @@ async def _handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYP
         if _order_manager_ref:
             await _order_manager_ref.cancel_all_orders()
         msg = _engine_ref.set_paper_mode()
-        await update.message.reply_text(f"<b>{msg}</b>", parse_mode="HTML")
+        await _safe_reply(update, f"<b>{msg}</b>")
         if _notifier_ref:
             await _notifier_ref.notify_mode_change("PAPER", "Cambiado por usuario")
 
@@ -680,7 +710,15 @@ async def start_telegram_polling(token: str = "", chat_id: str = "") -> Optional
         logger.warning("Telegram polling no iniciado (falta TELEGRAM_TOKEN)")
         return None
 
-    app = Application.builder().token(tok).build()
+    app = (
+        Application.builder()
+        .token(tok)
+        .read_timeout(15)
+        .write_timeout(15)
+        .connect_timeout(10)
+        .pool_timeout(10)
+        .build()
+    )
 
     # Registrar command handlers
     app.add_handler(CommandHandler("balance", cmd_balance))

@@ -133,7 +133,7 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
 
     while state.running:
         try:
-            market = rest.get_active_btc_5m_market()
+            market = await asyncio.to_thread(rest.get_active_btc_5m_market)
 
             if market:
                 market_id = market["market_id"]
@@ -143,13 +143,15 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
                 question  = market.get("question", "")
 
                 if market_id != state.active_market_id:
-                    storage.upsert_active_market(
-                        market_id=market_id,
-                        asset_id_yes=yes_id,
-                        asset_id_no=no_id,
-                        question=question,
-                        slug=slug,
-                        description=market.get("description", "")
+                    await asyncio.to_thread(
+                        lambda: storage.upsert_active_market(
+                            market_id=market_id,
+                            asset_id_yes=yes_id,
+                            asset_id_no=no_id,
+                            question=question,
+                            slug=slug,
+                            description=market.get("description", ""),
+                        )
                     )
                     state.update_market(market_id, yes_id, no_id, slug=slug)
                     logger.success(f"Nuevo mercado: {question} | {slug}")
@@ -166,21 +168,11 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
         await asyncio.sleep(MARKET_CHECK_INTERVAL)
 
 
-async def _run_trading_decision(state: BotState, market: dict) -> None:
-    """Ejecuta el ciclo completo de decision para un mercado nuevo."""
-    market_id = market["market_id"]
-    slug      = market.get("slug", "")
-    yes_id    = market["asset_id_yes"]
-    no_id     = market["asset_id_no"]
-    question  = market.get("question", "")
-
-    # Precio BTC actual para la notificacion
-    btc_now = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
-
-    if notifier:
-        await notifier.notify_new_market(slug, question, btc_price=btc_now)
-
-    # Obtener datos para features
+def _fetch_trading_data_sync() -> dict:
+    """
+    Obtiene datos para features desde la DB (sincrono).
+    Se ejecuta en un thread separado para no bloquear el event loop.
+    """
     conn = storage.get_connection()
     try:
         cutoff_ms = int(time.time() * 1000) - 3600_000
@@ -217,76 +209,108 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
         else:
             share_price = 0.5
 
+        return {
+            "btc_ticks": btc_ticks,
+            "bids": bids,
+            "asks": asks,
+            "trades_df": trades_df,
+            "recent_outcomes": recent_outcomes,
+            "share_price": share_price,
+        }
     finally:
         conn.close()
 
-    # Ejecutar decision
-    decision = engine.decide(
-        market_id=market_id,
-        slug=slug,
-        asset_id_yes=yes_id,
-        asset_id_no=no_id,
-        btc_ticks=btc_ticks,
-        latest_snapshot_bids=bids,
-        latest_snapshot_asks=asks,
-        recent_trades=trades_df,
-        share_price_yes=share_price,
-        share_price_yes_prev=None,
-        recent_outcomes=recent_outcomes,
-    )
 
-    # Notificar decision por Telegram (incluir precio BTC actual)
-    mode = engine.get_mode_str()
-    if notifier:
-        await notifier.notify_decision(decision.to_dict(), mode=mode, btc_price=btc_now)
+async def _run_trading_decision(state: BotState, market: dict) -> None:
+    """Ejecuta el ciclo completo de decision para un mercado nuevo."""
+    market_id = market["market_id"]
+    slug      = market.get("slug", "")
+    yes_id    = market["asset_id_yes"]
+    no_id     = market["asset_id_no"]
+    question  = market.get("question", "")
 
-    # --- PAPER WALLET: siempre (tracking) ---
-    if decision.action != "SKIP" and decision.usdc_amount > 0:
-        wallet.open_position(
+    try:
+        # Precio BTC actual para la notificacion
+        btc_now = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
+
+        if notifier:
+            await notifier.notify_new_market(slug, question, btc_price=btc_now)
+
+        # Obtener datos para features (en thread separado, no bloquea event loop)
+        data = await asyncio.to_thread(_fetch_trading_data_sync)
+
+        # Ejecutar decision
+        decision = engine.decide(
             market_id=market_id,
             slug=slug,
-            action=decision.action,
-            token_id=decision.token_id,
-            buy_price=decision.target_price,
-            usdc_amount=decision.usdc_amount,
-            n_shares=decision.n_shares,
-            fee=decision.fee_estimated,
-            prob_up=decision.prob_up,
-            confidence=decision.confidence,
+            asset_id_yes=yes_id,
+            asset_id_no=no_id,
+            btc_ticks=data["btc_ticks"],
+            latest_snapshot_bids=data["bids"],
+            latest_snapshot_asks=data["asks"],
+            recent_trades=data["trades_df"],
+            share_price_yes=data["share_price"],
+            share_price_yes_prev=None,
+            recent_outcomes=data["recent_outcomes"],
         )
 
-    # --- LIVE ORDER: solo si modo live activo y no pausado ---
-    if decision.action != "SKIP" and decision.usdc_amount > 0:
-        if engine.should_execute_live() and order_manager:
-            # Verificar safety
-            if safety and safety.is_circuit_breaker_active():
-                logger.warning("Circuit breaker activo — no se envia orden real")
-                if notifier:
-                    await notifier.notify_error("Orden no enviada: daily loss limit activo")
-            else:
-                logger.info(f"LIVE: enviando orden real | {decision.action} {slug}")
-                order_result = await order_manager.place_order(
-                    token_id=decision.token_id,
-                    price=decision.target_price,
-                    size=decision.n_shares,
-                    order_type=decision.order_type,
-                    usdc_amount=decision.usdc_amount,
-                )
+        # Notificar decision por Telegram (incluir precio BTC actual)
+        mode = engine.get_mode_str()
+        if notifier:
+            await notifier.notify_decision(decision.to_dict(), mode=mode, btc_price=btc_now)
 
-                if notifier:
-                    # Precio BTC al momento de ejecutar la orden
-                    btc_at_order = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
-                    await notifier.notify_order_sent({
-                        "success": order_result.success,
-                        "order_id": order_result.order_id,
-                        "order_type": order_result.order_type,
-                        "fill_price": order_result.fill_price,
-                        "shares_filled": order_result.shares_filled,
-                        "usdc_spent": order_result.usdc_spent,
-                        "was_upgraded": order_result.was_upgraded,
-                        "error": order_result.error,
-                        "btc_price": btc_at_order,
-                    })
+        # --- PAPER WALLET: siempre (tracking) ---
+        if decision.action != "SKIP" and decision.usdc_amount > 0:
+            wallet.open_position(
+                market_id=market_id,
+                slug=slug,
+                action=decision.action,
+                token_id=decision.token_id,
+                buy_price=decision.target_price,
+                usdc_amount=decision.usdc_amount,
+                n_shares=decision.n_shares,
+                fee=decision.fee_estimated,
+                prob_up=decision.prob_up,
+                confidence=decision.confidence,
+            )
+
+        # --- LIVE ORDER: solo si modo live activo y no pausado ---
+        if decision.action != "SKIP" and decision.usdc_amount > 0:
+            if engine.should_execute_live() and order_manager:
+                # Verificar safety
+                if safety and safety.is_circuit_breaker_active():
+                    logger.warning("Circuit breaker activo — no se envia orden real")
+                    if notifier:
+                        await notifier.notify_error("Orden no enviada: daily loss limit activo")
+                else:
+                    logger.info(f"LIVE: enviando orden real | {decision.action} {slug}")
+                    order_result = await order_manager.place_order(
+                        token_id=decision.token_id,
+                        price=decision.target_price,
+                        size=decision.n_shares,
+                        order_type=decision.order_type,
+                        usdc_amount=decision.usdc_amount,
+                    )
+
+                    if notifier:
+                        # Precio BTC al momento de ejecutar la orden
+                        btc_at_order = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
+                        await notifier.notify_order_sent({
+                            "success": order_result.success,
+                            "order_id": order_result.order_id,
+                            "order_type": order_result.order_type,
+                            "fill_price": order_result.fill_price,
+                            "shares_filled": order_result.shares_filled,
+                            "usdc_spent": order_result.usdc_spent,
+                            "was_upgraded": order_result.was_upgraded,
+                            "error": order_result.error,
+                            "btc_price": btc_at_order,
+                        })
+
+    except Exception as e:
+        logger.error(f"Error en trading decision para {slug}: {e}", exc_info=True)
+        if notifier:
+            await notifier.notify_error(f"Trading decision — {slug}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -301,107 +325,131 @@ async def resolved_markets_poller(state: BotState) -> None:
     logger.info("Resolved poller iniciado")
     await asyncio.sleep(30)
 
-    already_resolved: set[str] = set()
-    conn = storage.get_connection()
-    try:
-        rows = storage._fetchall(conn.cursor(), "SELECT market_id FROM resolved_markets")
-        already_resolved = {row["market_id"] for row in rows}
-    finally:
-        conn.close()
+    def _load_already_resolved() -> set:
+        conn = storage.get_connection()
+        try:
+            rows = storage._fetchall(conn.cursor(), "SELECT market_id FROM resolved_markets")
+            return {row["market_id"] for row in rows}
+        finally:
+            conn.close()
+
+    already_resolved: set[str] = await asyncio.to_thread(_load_already_resolved)
 
     while state.running:
         try:
-            resolved_list = rest.get_recent_resolved_btc_5m_markets(lookback_intervals=12)
+            resolved_list = await asyncio.to_thread(
+                rest.get_recent_resolved_btc_5m_markets, 12
+            )
 
             for r in resolved_list:
-                market_id = r["market_id"]
-                if market_id in already_resolved:
-                    continue
+                try:
+                    market_id = r["market_id"]
+                    if market_id in already_resolved:
+                        continue
 
-                ts_interval = r.get("ts_interval_start", 0)
-                ts_open_ms  = ts_interval * 1000
-                ts_close_ms = (ts_interval + 300) * 1000
+                    ts_interval = r.get("ts_interval_start", 0)
+                    ts_open_ms  = ts_interval * 1000
+                    ts_close_ms = (ts_interval + 300) * 1000
 
-                btc_open = state.get_open_price(market_id)
-                if btc_open is None:
-                    btc_open = storage.get_btc_price_at(ts_open_ms, source="chainlink")
-                if btc_open is None:
-                    btc_open = storage.get_btc_price_at(ts_open_ms, source="binance")
-
-                btc_close = storage.get_btc_price_at(ts_close_ms, source="chainlink")
-                if btc_close is None:
-                    btc_close = storage.get_btc_price_at(ts_close_ms, source="binance")
-                if btc_close is None:
-                    btc_close = state.last_btc_price_chainlink or state.last_btc_price_binance
-
-                storage.insert_resolved_market(
-                    market_id=market_id,
-                    asset_id_yes=r["asset_id_yes"],
-                    asset_id_no=r["asset_id_no"],
-                    winning_outcome=r["winning_outcome"],
-                    winning_asset=r.get("winning_asset_id", ""),
-                    question=r.get("question", ""),
-                    slug=r.get("slug", ""),
-                    btc_price_open=btc_open,
-                    btc_price_close=btc_close,
-                    ts_open=ts_open_ms if btc_open else None,
-                    ts_resolved=ts_close_ms
-                )
-                already_resolved.add(market_id)
-
-                direction = ""
-                if btc_open and btc_close:
-                    direction = "UP" if btc_close > btc_open else "DOWN"
-
-                logger.success(
-                    f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
-                    f"| BTC ${btc_open or 0:,.2f} -> ${btc_close or 0:,.2f} ({direction})"
-                )
-
-                # --- Cerrar posicion en paper wallet (SIEMPRE) ---
-                trade = wallet.resolve_position(market_id, r["winning_outcome"])
-                if trade:
-                    engine.update_capital(trade.pnl)
-                    balance = wallet.get_balance()
-                    if notifier:
-                        await notifier.notify_resolution(
-                            {
-                                "slug": trade.slug,
-                                "action": trade.action,
-                                "won": trade.won,
-                                "pnl": trade.pnl,
-                                "pnl_pct": trade.pnl_pct,
-                                "outcome": trade.winning_outcome,
-                                "btc_open": btc_open,
-                                "btc_close": btc_close,
-                            },
-                            balance
+                    btc_open = state.get_open_price(market_id)
+                    if btc_open is None:
+                        btc_open = await asyncio.to_thread(
+                            storage.get_btc_price_at, ts_open_ms, "chainlink"
                         )
-                else:
-                    # No habia posicion abierta, pero igual notificar el cierre del mercado
-                    if notifier:
-                        await notifier.notify_market_resolved(
-                            slug=r.get("slug", ""),
+                    if btc_open is None:
+                        btc_open = await asyncio.to_thread(
+                            storage.get_btc_price_at, ts_open_ms, "binance"
+                        )
+
+                    btc_close = await asyncio.to_thread(
+                        storage.get_btc_price_at, ts_close_ms, "chainlink"
+                    )
+                    if btc_close is None:
+                        btc_close = await asyncio.to_thread(
+                            storage.get_btc_price_at, ts_close_ms, "binance"
+                        )
+                    if btc_close is None:
+                        btc_close = state.last_btc_price_chainlink or state.last_btc_price_binance
+
+                    await asyncio.to_thread(
+                        lambda: storage.insert_resolved_market(
+                            market_id=market_id,
+                            asset_id_yes=r["asset_id_yes"],
+                            asset_id_no=r["asset_id_no"],
                             winning_outcome=r["winning_outcome"],
-                            btc_open=btc_open,
-                            btc_close=btc_close,
-                            had_position=False,
+                            winning_asset=r.get("winning_asset_id", ""),
+                            question=r.get("question", ""),
+                            slug=r.get("slug", ""),
+                            btc_price_open=btc_open,
+                            btc_price_close=btc_close,
+                            ts_open=ts_open_ms if btc_open else None,
+                            ts_resolved=ts_close_ms,
                         )
+                    )
+                    already_resolved.add(market_id)
 
-                    # --- Safety check (solo relevante si hubo live trade) ---
-                    if safety and not engine.paper_mode:
-                        safety_result = safety.record_trade(trade.pnl, trade.won)
-                        if safety_result["limit_triggered"]:
-                            # Forzar paper mode
-                            engine.set_paper_mode()
-                            if order_manager:
-                                await order_manager.cancel_all_orders()
-                            if notifier:
-                                await notifier.notify_safety_triggered(safety_result["message"])
-                                await notifier.notify_mode_change("PAPER", "Daily loss limit activado")
+                    direction = ""
+                    if btc_open and btc_close:
+                        direction = "UP" if btc_close > btc_open else "DOWN"
+
+                    logger.success(
+                        f"RESUELTO [{r['winning_outcome']}] {r.get('slug','')} "
+                        f"| BTC ${btc_open or 0:,.2f} -> ${btc_close or 0:,.2f} ({direction})"
+                    )
+
+                    # --- Cerrar posicion en paper wallet (SIEMPRE) ---
+                    trade = wallet.resolve_position(market_id, r["winning_outcome"])
+                    if trade:
+                        engine.update_capital(trade.pnl)
+                        balance = wallet.get_balance()
+                        if notifier:
+                            await notifier.notify_resolution(
+                                {
+                                    "slug": trade.slug,
+                                    "action": trade.action,
+                                    "won": trade.won,
+                                    "pnl": trade.pnl,
+                                    "pnl_pct": trade.pnl_pct,
+                                    "outcome": trade.winning_outcome,
+                                    "btc_open": btc_open,
+                                    "btc_close": btc_close,
+                                },
+                                balance
+                            )
+
+                        # --- Safety check (solo si hubo trade Y modo live) ---
+                        if safety and not engine.paper_mode:
+                            safety_result = safety.record_trade(trade.pnl, trade.won)
+                            if safety_result["limit_triggered"]:
+                                engine.set_paper_mode()
+                                if order_manager:
+                                    await order_manager.cancel_all_orders()
+                                if notifier:
+                                    await notifier.notify_safety_triggered(safety_result["message"])
+                                    await notifier.notify_mode_change("PAPER", "Daily loss limit activado")
+                    else:
+                        # No habia posicion abierta, notificar cierre del mercado
+                        if notifier:
+                            await notifier.notify_market_resolved(
+                                slug=r.get("slug", ""),
+                                winning_outcome=r["winning_outcome"],
+                                btc_open=btc_open,
+                                btc_close=btc_close,
+                                had_position=False,
+                            )
+
+                except Exception as e:
+                    slug = r.get("slug", r.get("market_id", "?"))
+                    logger.error(f"Error procesando mercado resuelto {slug}: {e}", exc_info=True)
+                    if notifier:
+                        await notifier.notify_error(
+                            f"Resolved poller — error en {slug}: {e}"
+                        )
 
         except Exception as e:
             logger.error(f"Error en resolved poller: {e}", exc_info=True)
+            if notifier:
+                await notifier.notify_error(f"Resolved poller crash: {e}")
 
         await asyncio.sleep(RESOLVED_POLL_INTERVAL)
 
@@ -417,7 +465,7 @@ async def stats_loop(state: BotState) -> None:
     while state.running:
         await asyncio.sleep(STATS_INTERVAL)
         try:
-            db_stats = storage.get_db_stats()
+            db_stats = await asyncio.to_thread(storage.get_db_stats)
             balance = wallet.get_balance() if wallet else {}
 
             price_str = f"${state.last_btc_price_binance:,.2f}" \
@@ -430,7 +478,7 @@ async def stats_loop(state: BotState) -> None:
             if wallet and poly_client and poly_client.is_ready():
                 pending = wallet.get_pending_payouts()
                 if pending["count"] > 0:
-                    current_usdc = poly_client.get_usdc_balance()
+                    current_usdc = await asyncio.to_thread(poly_client.get_usdc_balance)
                     # Si el balance real subio respecto al ultimo check,
                     # probablemente los redeems se procesaron
                     if current_usdc > _last_balance_check and _last_balance_check > 0:
@@ -460,7 +508,9 @@ async def stats_loop(state: BotState) -> None:
                 f"Open: {balance.get('posiciones_abiertas', 0)}{pending_str}"
             )
         except Exception as e:
-            logger.error(f"Error en stats loop: {e}")
+            logger.error(f"Error en stats loop: {e}", exc_info=True)
+            if notifier:
+                await notifier.notify_error(f"Stats loop: {e}")
 
 
 # ---------------------------------------------------------------------------

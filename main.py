@@ -53,6 +53,7 @@ from execution.order_manager import OrderManager
 from execution.heartbeat import HeartbeatManager
 from execution.safety import SafetyManager
 from execution.fill_simulator import FillSimulator
+from notifications.telegram import TelegramNotifier
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,7 @@ order_manager: OrderManager = None
 heartbeat: HeartbeatManager = None
 safety: SafetyManager = None
 fill_sim: FillSimulator = None
+tg: TelegramNotifier = None
 _last_decision_market: str = ""
 
 
@@ -147,6 +149,11 @@ async def market_discovery_and_trade_loop(state: BotState) -> None:
                     )
                     state.update_market(market_id, yes_id, no_id, slug=slug)
                     logger.success(f"Nuevo mercado: {question} | {slug}")
+
+                    # Telegram: nuevo mercado
+                    if tg:
+                        btc_now = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
+                        asyncio.create_task(tg.market_detected(question, slug, btc_now))
 
                     if market_id != _last_decision_market and engine is not None:
                         _last_decision_market = market_id
@@ -237,6 +244,12 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
             recent_outcomes=data["recent_outcomes"],
         )
 
+        # --- Telegram: SKIP del modelo ---
+        if decision.action == "SKIP" and tg:
+            asyncio.create_task(tg.model_skip(
+                slug, decision.confidence, decision.regime, decision.signal_reason
+            ))
+
         # --- PAPER WALLET: siempre (tracking) con fill simulado ---
         if decision.action != "SKIP" and decision.usdc_amount > 0:
             # Simular fill contra el order book real
@@ -265,11 +278,37 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
                     slippage=sim.slippage,
                     target_price=decision.target_price,
                 )
+
+                # Telegram: posicion abierta
+                if tg:
+                    total_cost = sim.shares_filled * sim.fill_price + sim.fee
+                    btc_now = state.last_btc_price_binance or state.last_btc_price_chainlink or 0
+                    asyncio.create_task(tg.position_opened({
+                        "action": decision.action,
+                        "slug": slug,
+                        "n_shares": sim.shares_filled,
+                        "fill_price": sim.fill_price,
+                        "slippage": sim.slippage,
+                        "fee": sim.fee,
+                        "total_cost": total_cost,
+                        "confidence": decision.confidence,
+                        "capital": wallet.capital,
+                        "btc_price": btc_now,
+                        "prob_up": decision.prob_up,
+                        "prob_down": decision.prob_down,
+                        "regime": decision.regime,
+                        "was_retry": sim.was_retry,
+                    }))
             else:
                 logger.info(
                     f"PAPER SKIP (no fill) | {decision.action} {slug} | "
                     f"{sim.reason}"
                 )
+                # Telegram: paper skip no fill
+                if tg:
+                    asyncio.create_task(tg.paper_skip_no_fill(
+                        decision.action, slug, sim.reason
+                    ))
 
         # --- LIVE ORDER: solo si modo live activo y no pausado ---
         if decision.action != "SKIP" and decision.usdc_amount > 0:
@@ -278,6 +317,14 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
                     logger.warning("Circuit breaker activo — no se envia orden real")
                 else:
                     logger.info(f"LIVE: enviando orden real | {decision.action} {slug}")
+
+                    # Telegram: live order enviada
+                    if tg:
+                        asyncio.create_task(tg.live_order_sent(
+                            decision.action, slug,
+                            decision.target_price, decision.n_shares,
+                        ))
+
                     order_result = await order_manager.place_order(
                         token_id=decision.token_id,
                         price=decision.target_price,
@@ -285,6 +332,19 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
                         order_type=decision.order_type,
                         usdc_amount=decision.usdc_amount,
                     )
+
+                    # Telegram: resultado de la orden live
+                    if tg and order_result:
+                        if order_result.success:
+                            asyncio.create_task(tg.live_order_filled(
+                                order_result.order_id,
+                                order_result.shares_filled,
+                                order_result.fill_price,
+                            ))
+                        else:
+                            asyncio.create_task(tg.live_order_failed(
+                                order_result.error
+                            ))
 
     except Exception as e:
         logger.error(f"Error en trading decision para {slug}: {e}", exc_info=True)
@@ -374,10 +434,36 @@ async def resolved_markets_poller(state: BotState) -> None:
                         f"| BTC ${btc_open or 0:,.2f} -> ${btc_close or 0:,.2f} ({direction})"
                     )
 
+                    # Telegram: mercado resuelto
+                    if tg:
+                        asyncio.create_task(tg.market_resolved(
+                            r["winning_outcome"], r.get("slug", ""),
+                            btc_open or 0, btc_close or 0, direction,
+                        ))
+
                     # --- Cerrar posicion en paper wallet (SIEMPRE) ---
                     trade = wallet.resolve_position(market_id, r["winning_outcome"])
                     if trade:
                         engine.update_capital(trade.pnl)
+
+                        # Telegram: WIN o LOSS
+                        if tg:
+                            balance = wallet.get_balance()
+                            asyncio.create_task(tg.position_closed({
+                                "won": trade.won,
+                                "action": trade.action,
+                                "slug": trade.slug,
+                                "outcome": trade.winning_outcome,
+                                "pnl": trade.pnl,
+                                "pnl_pct": trade.pnl_pct,
+                                "capital": wallet.capital,
+                                "win_rate": balance["win_rate"],
+                                "wins": balance["wins"],
+                                "losses": balance["losses"],
+                                "btc_open": btc_open or 0,
+                                "btc_close": btc_close or 0,
+                                "direction": direction,
+                            }))
 
                         # --- Safety check (solo si hubo trade Y modo live) ---
                         if safety and not engine.paper_mode:
@@ -386,6 +472,14 @@ async def resolved_markets_poller(state: BotState) -> None:
                                 engine.set_paper_mode()
                                 if order_manager:
                                     await order_manager.cancel_all_orders()
+
+                                # Telegram: daily loss limit
+                                if tg:
+                                    asyncio.create_task(tg.daily_loss_triggered(
+                                        safety_result["daily_pnl"],
+                                        safety_result["daily_pnl_pct"],
+                                        safety.daily_loss_limit_pct,
+                                    ))
 
                 except Exception as e:
                     slug = r.get("slug", r.get("market_id", "?"))
@@ -448,6 +542,20 @@ async def stats_loop(state: BotState) -> None:
                 f"({balance.get('wins', 0)}W/{balance.get('losses', 0)}L) | "
                 f"Open: {balance.get('posiciones_abiertas', 0)}{pending_str}"
             )
+
+            # Telegram: stats periodicos (frecuencia controlada por TG_STATS_INTERVAL)
+            if tg:
+                asyncio.create_task(tg.periodic_stats({
+                    "mode": mode,
+                    "btc_price": state.last_btc_price_binance,
+                    "equity": balance.get("equity_total", 0),
+                    "pnl": balance.get("pnl_total", 0),
+                    "pnl_pct": balance.get("pnl_total_pct", 0),
+                    "win_rate": balance.get("win_rate", 0),
+                    "wins": balance.get("wins", 0),
+                    "losses": balance.get("losses", 0),
+                    "open_positions": balance.get("posiciones_abiertas", 0),
+                }))
         except Exception as e:
             logger.error(f"Error en stats loop: {e}", exc_info=True)
 
@@ -457,7 +565,7 @@ async def stats_loop(state: BotState) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global wallet, engine, poly_client, order_manager, heartbeat, safety, fill_sim
+    global wallet, engine, poly_client, order_manager, heartbeat, safety, fill_sim, tg
 
     logger.info("=" * 60)
     logger.info("  BOT CRIPTO — Polymarket BTC 5-min Predictor")
@@ -487,7 +595,10 @@ async def main() -> None:
     )
     fill_sim = FillSimulator()
 
-    # 4. Inicializar Polymarket CLOB client (opcional — solo si hay credenciales)
+    # 4. Inicializar Telegram
+    tg = TelegramNotifier()
+
+    # 5. Inicializar Polymarket CLOB client (opcional — solo si hay credenciales)
     poly_client = PolymarketClient()
     poly_ready = poly_client.initialize()
 
@@ -504,10 +615,10 @@ async def main() -> None:
     else:
         logger.info("Polymarket LIVE no disponible (sin credenciales). Solo paper mode.")
 
-    # 5. Estado compartido
+    # 6. Estado compartido
     state = BotState()
 
-    # 6. Primer discovery
+    # 7. Primer discovery
     logger.info("Buscando mercado BTC 5-min activo...")
     market = rest.get_active_btc_5m_market()
     if market:
@@ -524,7 +635,7 @@ async def main() -> None:
             market["asset_id_no"], slug=market.get("slug", "")
         )
 
-    # 7. Notificar startup
+    # 8. Notificar startup
     collect_str = "ACTIVA" if storage.DATA_COLLECTION_ENABLED else "DESACTIVADA"
     logger.info(f"Recoleccion de datos: {collect_str}")
     logger.info(
@@ -533,7 +644,19 @@ async def main() -> None:
         f"poly={'ready' if poly_ready else 'off'}"
     )
 
-    # 8. Lanzar tareas
+    # 8b. Iniciar Telegram (command listener + notificacion de arranque)
+    if tg.is_enabled():
+        tg.set_components(wallet, engine, safety)
+        await tg.start()
+        await tg.bot_started({
+            "capital": INITIAL_CAPITAL,
+            "mode": engine.get_mode_str(),
+            "model": "cargado" if engine.predictor.is_loaded() else "NO cargado",
+            "db": "PostgreSQL" if storage.USE_POSTGRES else "SQLite",
+            "poly": "ready" if poly_ready else "off",
+        })
+
+    # 9. Lanzar tareas
     tasks = [
         asyncio.create_task(run_pipeline(state),                    name="websockets"),
         asyncio.create_task(market_discovery_and_trade_loop(state), name="discovery_trade"),
@@ -558,6 +681,12 @@ async def main() -> None:
             await order_manager.cancel_all_orders()
         for task in tasks:
             task.cancel()
+
+        # Telegram: notificar shutdown y detener
+        if tg and tg.is_enabled():
+            await tg.bot_stopped("shutdown normal")
+            await tg.stop()
+
         logger.info("Bot detenido correctamente")
 
 

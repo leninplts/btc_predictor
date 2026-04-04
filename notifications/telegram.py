@@ -430,7 +430,7 @@ class TelegramNotifier:
         btc_str = f"\nBTC: ${btc_price:,.2f}" if btc_price else ""
 
         await self._send(
-            f"Nuevo mercado <b>#{ref}</b>{period_str}{btc_str}\n"
+            f"==========\nNuevo mercado <b>#{ref}</b>{period_str}{btc_str}\n"
             f"{_esc(question)}"
         )
 

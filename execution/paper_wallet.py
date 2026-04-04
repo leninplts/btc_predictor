@@ -39,13 +39,16 @@ class OpenPosition:
     slug: str
     action: str           # "BUY_YES" | "BUY_NO"
     token_id: str
-    buy_price: float      # precio al que compramos
+    buy_price: float      # precio al que compramos (fill simulado o teorico)
     n_shares: float       # cantidad de shares
     usdc_invested: float  # USDC invertido en shares (sin fee): n_shares * buy_price
     fee_paid: float       # fee pagado (separado del costo de shares)
     timestamp_ms: int
     prob_up: float        # prediccion del modelo al momento de entrar
     confidence: float
+    simulated_fill: bool = False   # True si el precio viene del fill simulator
+    slippage: float = 0.0          # diferencia entre target_price y fill_price
+    target_price: float = 0.0      # precio original de la decision (antes de fill sim)
 
 
 @dataclass
@@ -104,6 +107,9 @@ class PaperWallet:
         fee: float,
         prob_up: float,
         confidence: float,
+        simulated_fill: bool = False,
+        slippage: float = 0.0,
+        target_price: float = 0.0,
     ) -> bool:
         """
         Abre una posicion en un mercado.
@@ -145,14 +151,20 @@ class PaperWallet:
             timestamp_ms=int(time.time() * 1000),
             prob_up=prob_up,
             confidence=confidence,
+            simulated_fill=simulated_fill,
+            slippage=slippage,
+            target_price=target_price or buy_price,
         )
         self.open_positions[market_id] = pos
 
+        sim_tag = ""
+        if simulated_fill:
+            sim_tag = f" [SIM FILL: slippage=${slippage:+.4f}]"
         logger.info(
             f"PAPER OPEN | {action} {slug} | "
             f"{n_shares:.1f} shares @ {buy_price:.4f} | "
             f"costo ${shares_cost:.2f} + fee ${fee:.4f} = ${total_cost:.2f} | "
-            f"capital restante: ${self.capital:.2f}"
+            f"capital restante: ${self.capital:.2f}{sim_tag}"
         )
         return True
 

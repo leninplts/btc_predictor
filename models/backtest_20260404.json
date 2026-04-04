@@ -1,0 +1,19 @@
+{
+  "initial_capital": 100.0,
+  "final_capital": 8285881408.654505,
+  "total_pnl": 8285881308.654503,
+  "total_pnl_pct": 8285881308.654504,
+  "total_fees": 306416216.9207327,
+  "n_markets": 1038,
+  "n_trades": 1021,
+  "n_skipped": 17,
+  "n_wins": 987,
+  "n_losses": 34,
+  "win_rate": 0.9666993143976493,
+  "avg_pnl": 8115456.7175852135,
+  "max_drawdown": -0.06369768944843707,
+  "sharpe_ratio": 814.7601232694543,
+  "profit_factor": 14.078789382579984,
+  "risk_per_trade": 0.02,
+  "min_confidence": 0.55
+}

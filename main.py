@@ -52,6 +52,7 @@ from execution.clob_client import PolymarketClient
 from execution.order_manager import OrderManager
 from execution.heartbeat import HeartbeatManager
 from execution.safety import SafetyManager
+from execution.fill_simulator import FillSimulator
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,7 @@ poly_client: PolymarketClient = None
 order_manager: OrderManager = None
 heartbeat: HeartbeatManager = None
 safety: SafetyManager = None
+fill_sim: FillSimulator = None
 _last_decision_market: str = ""
 
 
@@ -235,20 +237,39 @@ async def _run_trading_decision(state: BotState, market: dict) -> None:
             recent_outcomes=data["recent_outcomes"],
         )
 
-        # --- PAPER WALLET: siempre (tracking) ---
+        # --- PAPER WALLET: siempre (tracking) con fill simulado ---
         if decision.action != "SKIP" and decision.usdc_amount > 0:
-            wallet.open_position(
-                market_id=market_id,
-                slug=slug,
+            # Simular fill contra el order book real
+            sim = fill_sim.simulate_buy(
                 action=decision.action,
-                token_id=decision.token_id,
-                buy_price=decision.target_price,
-                usdc_amount=decision.usdc_amount,
+                target_price=decision.target_price,
                 n_shares=decision.n_shares,
-                fee=decision.fee_estimated,
-                prob_up=decision.prob_up,
-                confidence=decision.confidence,
+                bids=data["bids"],
+                asks=data["asks"],
             )
+
+            if sim.filled:
+                # Usar datos del fill simulado (precio real, fee real)
+                wallet.open_position(
+                    market_id=market_id,
+                    slug=slug,
+                    action=decision.action,
+                    token_id=decision.token_id,
+                    buy_price=sim.fill_price,
+                    usdc_amount=sim.shares_filled * sim.fill_price,
+                    n_shares=sim.shares_filled,
+                    fee=sim.fee,
+                    prob_up=decision.prob_up,
+                    confidence=decision.confidence,
+                    simulated_fill=True,
+                    slippage=sim.slippage,
+                    target_price=decision.target_price,
+                )
+            else:
+                logger.info(
+                    f"PAPER SKIP (no fill) | {decision.action} {slug} | "
+                    f"{sim.reason}"
+                )
 
         # --- LIVE ORDER: solo si modo live activo y no pausado ---
         if decision.action != "SKIP" and decision.usdc_amount > 0:
@@ -436,7 +457,7 @@ async def stats_loop(state: BotState) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global wallet, engine, poly_client, order_manager, heartbeat, safety
+    global wallet, engine, poly_client, order_manager, heartbeat, safety, fill_sim
 
     logger.info("=" * 60)
     logger.info("  BOT CRIPTO — Polymarket BTC 5-min Predictor")
@@ -464,6 +485,7 @@ async def main() -> None:
         daily_loss_limit_pct=DAILY_LOSS_LIMIT,
         initial_capital=INITIAL_CAPITAL,
     )
+    fill_sim = FillSimulator()
 
     # 4. Inicializar Polymarket CLOB client (opcional — solo si hay credenciales)
     poly_client = PolymarketClient()

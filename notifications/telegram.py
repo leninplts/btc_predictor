@@ -87,19 +87,6 @@ def _slug_period(slug: str) -> str:
         return ""
 
 
-def _slug_ref_number(slug: str) -> int:
-    """
-    Genera un numero de referencia corto a partir del slug.
-    Usa los ultimos 4 digitos del timestamp para crear un # unico
-    pero corto y facil de recordar.
-    """
-    try:
-        ts = int(slug.rsplit("-", 1)[-1])
-        return ts % 10000
-    except (ValueError, IndexError):
-        return 0
-
-
 # ---------------------------------------------------------------------------
 # Notifier
 # ---------------------------------------------------------------------------
@@ -133,6 +120,10 @@ class TelegramNotifier:
         self._polling_task: Optional[asyncio.Task] = None
         self._stats_counter: int = 0
 
+        # Contador consecutivo de mercados: slug -> #N
+        self._market_counter: int = 0
+        self._market_refs: dict[str, int] = {}
+
         # Referencias a componentes del bot (se setean desde main.py)
         self._wallet: Optional["PaperWallet"] = None
         self._engine: Optional["StrategyEngine"] = None
@@ -157,6 +148,17 @@ class TelegramNotifier:
 
     def is_enabled(self) -> bool:
         return self._enabled
+
+    def _ref(self, slug: str) -> int:
+        """
+        Devuelve el numero de referencia consecutivo para un slug.
+        Si es un slug nuevo, incrementa el contador.
+        Si ya se vio, devuelve el mismo numero (consistente en todo el ciclo).
+        """
+        if slug not in self._market_refs:
+            self._market_counter += 1
+            self._market_refs[slug] = self._market_counter
+        return self._market_refs[slug]
 
     def set_components(
         self,
@@ -318,7 +320,7 @@ class TelegramNotifier:
         regime = data.get("regime", "")
         was_retry = data.get("was_retry", False)
 
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f" ({period})" if period else ""
         slip_str = f" (slippage: ${slippage:+.4f})" if slippage != 0 else ""
@@ -356,7 +358,7 @@ class TelegramNotifier:
         btc_close = data.get("btc_close", 0)
         direction = data.get("direction", "")
 
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f" ({period})" if period else ""
 
@@ -380,7 +382,7 @@ class TelegramNotifier:
 
     async def paper_skip_no_fill(self, action: str, slug: str, reason: str) -> None:
         """Notifica que una orden paper no se lleno."""
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f" ({period})" if period else ""
 
@@ -424,7 +426,7 @@ class TelegramNotifier:
         if not self._notify_market:
             return
 
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f"\nPeriodo: <b>{period}</b>" if period else ""
         btc_str = f"\nBTC: ${btc_price:,.2f}" if btc_price else ""
@@ -439,7 +441,7 @@ class TelegramNotifier:
         btc_open: float, btc_close: float, direction: str,
     ) -> None:
         """Notifica mercado resuelto."""
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f" ({period})" if period else ""
 
@@ -457,7 +459,7 @@ class TelegramNotifier:
         if not self._notify_skip:
             return
 
-        ref = _slug_ref_number(slug)
+        ref = self._ref(slug)
         period = _slug_period(slug)
         period_str = f" ({period})" if period else ""
 
